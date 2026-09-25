@@ -31,6 +31,12 @@ and `codespace find <query>` searches files through that app's helper. Set trust
 `~/.config/codespace/config.json`, for example `{"hosts":{"mini":"user@mac-mini.local"}}`.
 Space remains a separate optional install for now.
 
+`codespace sync` publishes each machine's provider names and connection alias to
+`~/Space/.codespace/machines/`; `codespace sync status` reads the shared catalog. The catalog contains no API
+keys, OAuth tokens, emails, or local credential paths. Provider login remains on the machine that runs the agent.
+Set `sync_uri` in the same config file to a `gs://.../machines` path to read and write the catalog through GCS
+directly when the mounted drive is slow.
+
 ## Features
 
 

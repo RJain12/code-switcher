@@ -4,10 +4,15 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
+import time
 
 CONFIG = Path.home() / ".config" / "codespace" / "config.json"
+CATALOG = Path.home() / "Space" / ".codespace" / "machines"
+CATALOG_CACHE = Path.home() / ".config" / "codespace" / "machines.json"
 
 
 def config():
@@ -27,6 +32,82 @@ def require(name):
     return binary
 
 
+def sync(args):
+    if args not in ([], ["status"]):
+        raise SystemExit("usage: codespace sync [status]")
+    uri = config().get("sync_uri")
+    if uri and (not isinstance(uri, str) or not uri.startswith("gs://") or any(c.isspace() for c in uri)):
+        raise SystemExit("codespace: sync_uri must be a gs:// path")
+    if not uri and not os.path.ismount(CATALOG.parents[1]):
+        raise SystemExit("codespace: mount Space before syncing (`space mount`)")
+    gcloud = shutil.which("gcloud") or "/opt/homebrew/bin/gcloud"
+    cloud_python = "/opt/homebrew/bin/python3" if Path("/opt/homebrew/bin/python3").exists() else (
+        shutil.which("python3") or sys.executable
+    )
+    cloud_env = dict(os.environ, CLOUDSDK_PYTHON=cloud_python)
+    if not args:
+        settings = config()
+        host = socket.gethostname()
+        accounts_path = Path.home() / ".code-accounts" / "accounts.json"
+        try:
+            accounts = json.loads(accounts_path.read_text()).get("accounts", [])
+        except (OSError, ValueError):
+            accounts = []
+        profiles = [{key: account[key] for key in ("id", "provider", "name") if key in account}
+                    for account in accounts]
+        t3_id_path = Path.home() / ".t3" / "userdata" / "environment-id"
+        try:
+            t3_id = t3_id_path.read_text().strip()[:200]
+        except OSError:
+            t3_id = None
+        record = {"version": 1, "machine": host, "alias": settings.get("self_alias"),
+                  "ssh_host": settings.get("ssh_host"), "profiles": profiles,
+                  "t3_environment_id": t3_id, "space": bool(shutil.which("space")),
+                  "updated_at": time.time()}
+        if uri:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as output:
+                json.dump(record, output, indent=2)
+                temporary = output.name
+            try:
+                subprocess.run([gcloud, "storage", "cp", temporary,
+                                uri.rstrip("/") + "/" + host + ".json", "-q"],
+                               check=True, timeout=45, env=cloud_env, capture_output=True, text=True)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+        else:
+            CATALOG.mkdir(parents=True, exist_ok=True)
+            target = CATALOG / (host + ".json")
+            temporary = target.with_suffix(".tmp")
+            temporary.write_text(json.dumps(record, indent=2) + "\n")
+            temporary.replace(target)
+    machines = []
+    if uri:
+        listed = subprocess.run([gcloud, "storage", "ls", uri.rstrip("/") + "/"],
+                                capture_output=True, text=True, timeout=30, env=cloud_env)
+        paths = [line for line in listed.stdout.splitlines() if line.endswith(".json")] if listed.returncode == 0 else []
+    else:
+        paths = list(CATALOG.glob("*.json")) if CATALOG.exists() else []
+    for path in paths:
+        try:
+            if uri:
+                content = subprocess.run([gcloud, "storage", "cat", str(path)],
+                                         capture_output=True, text=True, check=True, timeout=30,
+                                         env=cloud_env).stdout
+            else:
+                content = path.read_text()
+            record = json.loads(content)
+            if record.get("version") == 1:
+                machines.append(record)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+    machines.sort(key=lambda item: item.get("alias") or item.get("machine") or "")
+    CATALOG_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CATALOG_CACHE.write_text(json.dumps(machines, indent=2) + "\n")
+    CATALOG_CACHE.chmod(0o600)
+    print(json.dumps(machines, indent=2))
+    return 0
+
+
 def dispatch(argv):
     if not argv or argv[0] in ("code", "local"):
         args = argv[1:] if argv else []
@@ -40,6 +121,7 @@ codespace space [args]        run the Space CLI on this Mac
 codespace job [args]          explicitly offload work to a Space worker
 codespace menu [args]         install, update, or remove the Space menu app
 codespace find <query>        search this Mac, a peer Mac, and Space
+codespace sync [status]        publish or inspect nonsecret machine/provider profiles
 
 Aliases for `on` live in ~/.config/codespace/config.json:
   {"hosts":{"mini":"clawdbot@Clawdbots-Mac-mini.local"}}
@@ -49,7 +131,16 @@ Local work stays local unless you choose `on` or `job`.""")
         if not args:
             raise SystemExit("usage: codespace on <host-or-alias> [code args]")
         host, *code_args = args
+        alias = host
         host = config().get("hosts", {}).get(host, host)
+        if host == alias:
+            try:
+                for machine in json.loads(CATALOG_CACHE.read_text()):
+                    if machine.get("alias") == alias and machine.get("ssh_host"):
+                        host = machine["ssh_host"]
+                        break
+            except (OSError, ValueError):
+                pass
         if not isinstance(host, str) or host.startswith("-") or any(c.isspace() for c in host):
             raise SystemExit("codespace: invalid SSH host")
         # SSH command arguments are parsed by the remote shell. Quote the fixed
@@ -60,6 +151,8 @@ Local work stays local unless you choose `on` or `job`.""")
         remote = remote.replace("'$HOME/.local/bin/code'", '"$HOME/.local/bin/code"', 1)
         tty = ["-tt"] if sys.stdin.isatty() and sys.stdout.isatty() else ["-T"]
         return subprocess.call(["ssh", *tty, "-o", "ConnectTimeout=8", host, remote])
+    if command == "sync":
+        return sync(args)
     if command in ("space", "job", "menu"):
         sub = args if command == "space" else ["job", *args] if command == "job" else ["menubar", *args]
         return subprocess.call([require("space"), *sub])
