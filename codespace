@@ -519,7 +519,7 @@ def account_plan(manifests):
         for alias in reachable:
             if alias in present:
                 continue
-            unverified = any(a["provider"] == group["provider"] and a["login"] == "unknown"
+            unverified = any(a["provider"] == group["provider"] and (a["login"] == "unknown" or not a.get("identity"))
                              for a in manifests[alias]["accounts"])
             if unverified:
                 continue
