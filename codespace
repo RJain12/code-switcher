@@ -465,8 +465,13 @@ def maintenance():
             return {"status": "not-configured"}
         sync([], quiet=True)
         return {"status": "synchronized"}
+    def refresh_providers():
+        if config().get("t3_auto_providers") is not True:
+            return {"status": "not-configured"}
+        return t3(["providers", "--apply"], quiet=True)
     for name, action in (("t3", lambda: renew_t3_connection(if_needed=True)),
-                         ("sync", refresh_catalog), ("update", lambda: update([]))):
+                         ("providers", refresh_providers), ("sync", refresh_catalog),
+                         ("update", lambda: update([]))):
         try:
             results[name] = {"ok": True, "result": action()}
         except (Exception, SystemExit) as error:
@@ -576,7 +581,7 @@ def t3_start(args, base, token):
     return 0
 
 
-def t3(args):
+def t3(args, quiet=False):
     """Call the T3 instance on the execution host; never relocate native logins."""
     import urllib.error
     import urllib.parse
@@ -654,7 +659,10 @@ def t3(args):
                     for key, value in plan["additions"].items():
                         if updated.get("providerInstances", {}).get(key, {}).get("config", {}).get("homePath") != value["config"]["homePath"]:
                             raise SystemExit("codespace: T3 did not confirm the expected provider home")
-                print(json.dumps({"applied": args[-1] == "--apply", **plan}, indent=2))
+                result = {"applied": args[-1] == "--apply", **plan}
+                if quiet:
+                    return result
+                print(json.dumps(result, indent=2))
                 return 0
             except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
                 raise SystemExit("codespace: provider synchronization failed: " + str(error)) from None

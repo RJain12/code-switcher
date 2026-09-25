@@ -47,3 +47,12 @@ class Sync(unittest.TestCase):
         with patch.object(self.client, 'renew_t3_connection', return_value={'status': 'current'}), patch.object(self.client, 'sync', side_effect=ValueError('offline')), patch.object(self.client, 'update', return_value=0) as update, patch('builtins.print'):
             self.assertEqual(self.client.maintenance(), 1)
             update.assert_called_once()
+
+    def test_provider_mapping_is_opt_in_and_failure_does_not_block_sync(self):
+        with patch.object(self.client, 'renew_t3_connection', return_value={}), patch.object(self.client, 'sync') as sync, patch.object(self.client, 'update', return_value=0), patch.object(self.client, 't3', side_effect=SystemExit('T3 offline')) as t3, patch('builtins.print'):
+            self.assertEqual(self.client.maintenance(), 0)
+            t3.assert_not_called()
+            self.client.private_json_write(self.client.CONFIG, {'sync_uri': 'gs://fixture/machines', 't3_auto_providers': True})
+            self.assertEqual(self.client.maintenance(), 1)
+            t3.assert_called_once_with(['providers', '--apply'], quiet=True)
+            self.assertEqual(sync.call_count, 2)

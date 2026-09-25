@@ -130,6 +130,11 @@ environment settings. T3 reads the existing account credentials locally; this do
 between machines. Cursor and OpenRouter mappings are reported as unsupported until their credential
 adapters are implemented. Run the same command through `codespace on mini` for the mini's accounts.
 
+Set `"t3_auto_providers": true` in `~/.config/codespace/config.json` to apply this mapping during
+hourly/login maintenance. New supported Code accounts then appear in that machine's T3 automatically.
+Existing provider instances, including disabled ones, are preserved. T3 must be running; failures are
+reported and retried on the next maintenance run without preventing catalog sync or CLI updates.
+
 `scan` returns native projects and their existing T3 project IDs when available. `import-project`
 imports recent supported CLI history for an existing T3 project using T3's scanner and resume bindings.
 Stop native CLI sessions for that project first. This operation can import multiple sessions across
