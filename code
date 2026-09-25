@@ -1036,8 +1036,19 @@ class EffortProxy:
                 continue
             h.send_header(k, v)
         h.end_headers()
-        keep_all = h.command == "GET" and path.endswith("/models") and resp.status == 200
-        tail, full = b"", []
+        if h.command == "GET" and path.endswith("/models") and resp.status == 200:
+            # small JSON: learn each model's effort levels before Codex sees it, so no request can race ahead
+            data = resp.read()
+            conn.close()
+            try:
+                catalog = efforts_from_catalog(json.loads(decompress(data, resp.getheader("Content-Encoding"))))
+                with self.lock:
+                    self.model_levels.update(catalog)
+            except Exception:
+                pass
+            h.wfile.write(data)
+            return
+        tail = b""
         try:
             while True:
                 chunk = resp.read1(65536)
@@ -1046,19 +1057,10 @@ class EffortProxy:
                 h.wfile.write(chunk)
                 h.wfile.flush()
                 tail = (tail + chunk)[-65536:]
-                if keep_all:
-                    full.append(chunk)
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
             conn.close()
-        if keep_all:
-            try:
-                catalog = efforts_from_catalog(json.loads(decompress(b"".join(full), resp.getheader("Content-Encoding"))))
-                with self.lock:
-                    self.model_levels.update(catalog)
-            except Exception:
-                pass
         if key:
             inp_t = re.findall(rb'"input_tokens":\s*(\d+)', tail)
             cached = re.findall(rb'"cached_tokens":\s*(\d+)', tail)
