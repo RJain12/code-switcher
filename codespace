@@ -149,7 +149,7 @@ def auto_update(args):
         raise SystemExit("codespace: run `codespace update --install` first")
     validate_release(current)
     plist.parent.mkdir(parents=True, exist_ok=True)
-    document = {"Label": label, "ProgramArguments": [sys.executable, str(current / "codespace"), "update"],
+    document = {"Label": label, "ProgramArguments": [sys.executable, str(current / "codespace"), "maintenance"],
                 "StartInterval": 3600, "RunAtLoad": True,
                 "ProcessType": "Background", "LowPriorityIO": True,
                 "StandardOutPath": str(RELEASE_ROOT / "update.log"),
@@ -354,11 +354,127 @@ def t3_provider_plan(accounts, settings, home=None):
     return {"additions": additions, "mappings": mappings, "skipped": skipped}
 
 
+def read_t3_token(path):
+    info = path.stat()
+    if info.st_mode & 0o077 or info.st_uid != os.getuid():
+        raise ValueError("T3 token file must be owned by you and private (chmod 600)")
+    raw = path.read_text().strip()
+    if raw.startswith("{"):
+        data = json.loads(raw)
+        if data.get("version") != 1 or data.get("managedBy") != "codespace":
+            raise ValueError("unsupported T3 connection file")
+        return data["token"], data
+    return raw, None
+
+
+def private_json_write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temporary = tempfile.mkstemp(prefix=".connection-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as output:
+            json.dump(value, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def verify_t3_token(base, token):
+    import urllib.request
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    request = urllib.request.Request(base.rstrip("/") + "/api/auth/session", headers={"Authorization": "Bearer " + token})
+    with urllib.request.build_opener(NoRedirect).open(request, timeout=10) as response:
+        state = json.load(response)
+    if state.get("authenticated") is not True:
+        raise ValueError("T3 did not authenticate the new connection")
+
+
+def renew_t3_connection(if_needed=False):
+    import datetime
+    import fcntl
+    import plistlib
+    import urllib.parse
+    settings = config()
+    path = Path(settings.get("t3_token_file", str(CONFIG.parent / "t3-token"))).expanduser()
+    if os.environ.get("CODESPACE_T3_TOKEN"):
+        if if_needed:
+            return {"status": "external-token"}
+        raise ValueError("unset CODESPACE_T3_TOKEN before enrolling a managed connection")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with path.with_suffix(".renew-lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        old_token, old = read_t3_token(path) if path.exists() else (None, None)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        expires = datetime.datetime.fromisoformat(old["expiresAt"].replace("Z", "+00:00")) if old else None
+        if if_needed and not old:
+            return {"status": "unmanaged"}
+        if if_needed and expires > now + datetime.timedelta(days=7):
+            return {"status": "current", "expiresAt": old["expiresAt"]}
+        base = settings.get("t3_url", "http://127.0.0.1:3773")
+        url = urllib.parse.urlsplit(base)
+        if (url.scheme != "http" or url.hostname not in ("127.0.0.1", "localhost", "::1")
+                or url.username or url.password or url.query or url.fragment or url.path not in ("", "/")):
+            raise ValueError("managed renewal must run on the T3 host using its loopback HTTP URL")
+        data_dir = Path(settings.get("t3_base_dir", str(Path.home() / ".t3"))).expanduser().resolve()
+        runtime = json.loads((data_dir / "userdata" / "server-runtime.json").read_text())
+        if runtime.get("port") != (url.port or 80):
+            raise ValueError("T3 URL does not match this host's runtime port")
+        if old and (old.get("baseDir") != str(data_dir) or old.get("baseUrl") != base.rstrip("/")):
+            raise ValueError("managed T3 connection belongs to a different host or data directory")
+        if if_needed and expires > now:
+            # Do not silently undo an intentional server-side revocation.
+            verify_t3_token(base, old_token)
+        app = Path(settings.get("t3_app", "/Applications/T3 Code (Alpha).app"))
+        with (app / "Contents" / "Info.plist").open("rb") as source:
+            executable = plistlib.load(source)["CFBundleExecutable"]
+        binary = app / "Contents" / "MacOS" / executable
+        entry = app / "Contents" / "Resources" / "app.asar" / "apps" / "server" / "dist" / "bin.mjs"
+        command = [str(binary), str(entry), "auth", "session"]
+        environment = dict(os.environ, ELECTRON_RUN_AS_NODE="1")
+        issued = subprocess.run([*command, "issue", "--base-dir", str(data_dir), "--ttl", "30d",
+                                 "--label", "Codespace managed CLI connection", "--json"],
+                                env=environment, capture_output=True, text=True, timeout=30)
+        if issued.returncode:
+            raise ValueError("the installed T3 CLI could not issue a connection token")
+        record = json.loads(issued.stdout)
+        token = record.get("token")
+        expiry = datetime.datetime.fromisoformat(record["expiresAt"].replace("Z", "+00:00"))
+        if not isinstance(token, str) or not token or any(c.isspace() for c in token) or expiry <= now:
+            raise ValueError("T3 returned an invalid connection token or expiry")
+        verify_t3_token(base, token)
+        private_json_write(path, {"version": 1, "managedBy": "codespace", "token": token,
+                                 "sessionId": record["sessionId"], "expiresAt": record["expiresAt"],
+                                 "baseDir": str(data_dir), "baseUrl": base.rstrip("/")})
+        cleanup = "none"
+        if old and old.get("sessionId") and old["sessionId"] != record["sessionId"]:
+            revoked = subprocess.run([*command, "revoke", old["sessionId"], "--base-dir", str(data_dir)],
+                                     env=environment, capture_output=True, timeout=30)
+            cleanup = "revoked" if revoked.returncode == 0 else "pending"
+        return {"status": "renewed", "expiresAt": record["expiresAt"], "previousSession": cleanup}
+
+
+def maintenance():
+    results = {}
+    for name, action in (("t3", lambda: renew_t3_connection(if_needed=True)), ("update", lambda: update([]))):
+        try:
+            results[name] = {"ok": True, "result": action()}
+        except (Exception, SystemExit) as error:
+            results[name] = {"ok": False, "error": str(error)}
+    print(json.dumps(results, indent=2))
+    return 0 if all(result["ok"] for result in results.values()) else 1
+
+
 def t3(args):
     """Call the T3 instance on the execution host; never relocate native logins."""
     import urllib.error
     import urllib.parse
     import urllib.request
+    if args in (["connect"], ["renew"]):
+        print(json.dumps(renew_t3_connection(if_needed=args == ["renew"]), indent=2))
+        return 0
     if args and args[0] == "import":
         export_args = args[1:]
         if "--stopped" not in export_args and "--completed" not in export_args:
@@ -381,10 +497,7 @@ def t3(args):
     if not token:
         token_path = Path(settings.get("t3_token_file", str(CONFIG.parent / "t3-token"))).expanduser()
         try:
-            info = token_path.stat()
-            if info.st_mode & 0o077 or info.st_uid != os.getuid():
-                raise SystemExit("codespace: T3 token file must be owned by you and private (chmod 600)")
-            token = token_path.read_text().strip()
+            token, _ = read_t3_token(token_path)
         except OSError:
             raise SystemExit("codespace: configure CODESPACE_T3_TOKEN or a private t3_token_file from `t3 auth session issue --token-only`") from None
     if not token or any(c.isspace() for c in token):
@@ -473,6 +586,8 @@ codespace space [args]        run the Space CLI on this Mac
 codespace job [args]          explicitly offload work to a Space worker
 codespace menu [args]         install, update, or remove the Space menu app
 codespace find <query>        search this Mac, a peer Mac, and Space
+codespace t3 connect           enroll renewable local T3 access
+codespace t3 renew             renew a managed token when due
 codespace t3 providers [--apply] map Code accounts into this host’s T3
 codespace t3 scan             discover native sessions using installed T3
 codespace t3 import-project ID import native history into an existing T3 project
@@ -510,6 +625,8 @@ Local work stays local unless you choose `on` or `job`.""")
         remote = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; ' + remote
         tty = ["-tt"] if sys.stdin.isatty() and sys.stdout.isatty() else ["-T"]
         return subprocess.call(["ssh", *tty, "-o", "ConnectTimeout=8", host, remote])
+    if command == "maintenance":
+        return maintenance()
     if command == "auto-update":
         return auto_update(args)
     if command == "update" and "--providers" not in args:

@@ -54,12 +54,13 @@ up under `~/.local/share/codespace/original-entrypoints`. A failed download leav
 active. Prior releases remain available for rollback. Disable automatic updates before rolling back
 if you want to stay on that release. The launchd task checks hourly and at login while your Mac is
 awake; logs live under `~/.local/share/codespace/`. Run setup separately on each Mac. This updates
-the CLI pair; T3, the menu app, provider binaries, and cloud workers retain their own update paths.
+the CLI pair and renews enrolled local T3 connections; T3, the menu app, provider binaries, and cloud
+workers retain their own update paths.
 
 ### Installed T3 integration
 
 T3 0.0.42 includes native session discovery and project history import. Configure the local
-T3 token as described below, then use these commands with the installed app:
+T3 connection with `codespace t3 connect`, then use these commands with the installed app:
 
 ```sh
 codespace t3 providers          # preview native account mappings
@@ -82,6 +83,21 @@ configured provider instances. It requires Node 22+ for native WebSocket support
 through stdin and a single-use WebSocket ticket, not command-line arguments. Discovery can take
 several minutes when provider history is stored on a network drive. `t3_timeout_seconds` in the
 Codespace config controls the request deadline (default 180 seconds, maximum 1800).
+
+### Renewable local T3 connections
+
+`codespace t3 connect` enrolls this Mac using the installed T3 app's admin CLI and verifies the new token
+against its running server. The connection file is private (mode 600) and replaced atomically.
+`codespace t3 renew` renews it only when fewer than seven days remain. The hourly macOS maintenance
+job runs renewal automatically after `codespace auto-update enable`; run that command again to upgrade
+an older update-only task. Expired tokens can recover after a long offline period. A pre-expiry
+revocation is respected; explicitly reconnect if you want to authorize access again.
+
+Run `codespace on mini t3 connect` to enroll the Mac mini. Each device administers its own loopback
+T3 endpoint; credentials are not sent between hosts. `CODESPACE_T3_TOKEN` remains an external override
+and is never rotated. `t3_app` and `t3_base_dir` configure a different installed bundle/data directory.
+Provider OAuth/API credentials are separate: vendor revocation or a required interactive login cannot
+be made permanent by Codespace.
 
 ### Single-session handoff (older bridge preview)
 
