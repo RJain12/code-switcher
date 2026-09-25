@@ -9,6 +9,9 @@ class Adopt(unittest.TestCase):
     def test_adopts_in_place_deduplicates_and_removes_only_registration(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ):
             code = load(home=tmp)
+            # macOS aliases /var to /private/var. Use the canonical data root so
+            # the external-home guard, not a mismatched prefix, protects the file.
+            code.DATA = os.path.realpath(code.DATA)
             home = Path(code.DATA) / 'existing'
             home.mkdir(parents=True)
             credential = home / 'auth.json'
@@ -20,6 +23,7 @@ class Adopt(unittest.TestCase):
             self.assertEqual(len(db['accounts']), 1)
             self.assertTrue(db['accounts'][0]['external_home'])
             self.assertEqual(db['accounts'][0]['home'], str(home.resolve()))
+            self.assertTrue(db['accounts'][0]['home'].startswith(code.DATA + os.sep))
             code.remove_account(db, db['accounts'][0])
             self.assertEqual(db['accounts'], [])
             self.assertEqual(credential.read_text(), 'original opaque content')
