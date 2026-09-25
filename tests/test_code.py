@@ -381,6 +381,28 @@ class Signals(unittest.TestCase):
         self.assertEqual(info["resets"], 2)
         self.assertEqual(info["windows"][0]["label"], "wk")
 
+    def test_cursor_usage_parses_plan_usage(self):
+        self.m.keychain_get = lambda service, account: "tok"
+        self.m.cursor_email = lambda a: "me@x"
+        replies = {
+            "GetCurrentPeriodUsage": {"billingCycleEnd": "1790550000000", "planUsage": {
+                "remaining": 500, "limit": 2000, "totalPercentUsed": 75}},
+            "GetPlanInfo": {"planInfo": {"planName": "Pro"}},
+            "GetCreditGrantsBalance": {"hasCreditGrants": True, "creditBalanceCents": "1250"},
+        }
+        self.m.cursor_rpc = lambda token, method: replies[method]
+        info = self.m.fetch_cursor({"id": "cursor-default", "provider": "cursor", "home": None})
+        self.assertEqual(info["windows"], [{"label": "mo", "pct": 75.0, "reset": 1790550000.0}])
+        self.assertEqual(info["plan"], "Pro, $12.50 credits")
+        replies["GetCurrentPeriodUsage"] = {"planUsage": {"remaining": 500, "limit": 2000}}
+        self.assertEqual(self.m.fetch_cursor({"id": "c", "provider": "cursor", "home": None})["windows"][0]["pct"], 75.0)
+
+    def test_existing_browser_login_is_not_adopted_twice(self):
+        self.m.keychain_get = lambda service, account: "tok"
+        db = {"accounts": [{"id": "cursor-work", "provider": "cursor", "name": "work", "home": None}], "last": None}
+        self.m.detect_defaults(db)
+        self.assertEqual([a["id"] for a in db["accounts"] if a["provider"] == "cursor"], ["cursor-work"])
+
     def test_redact(self):
         r = self.m.redact
         self.assertEqual(r("key sk-proj-abcdefghijklmnop1234"), "key [redacted]")

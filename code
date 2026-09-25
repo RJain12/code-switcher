@@ -152,8 +152,8 @@ def update_acct(db, aid, **fields):
 def detect_defaults(db):
     """Adopt logins that already exist on this machine, once each (removed ones stay removed)."""
     seen = set(db.setdefault("seen_defaults", []))
-    if not seen:  # accounts created by older versions
-        seen.update(a["provider"] for a in db["accounts"] if not a.get("home"))
+    # a login already used by some account (default home, no API key) must not be adopted a second time
+    seen.update(a["provider"] for a in db["accounts"] if not a.get("home") and not a.get("keyed"))
     checks = {
         "codex": lambda: os.path.exists(os.path.join(HOME, ".codex", "auth.json")),
         "claude": lambda: bool(binary_for("claude")),
@@ -400,17 +400,21 @@ def fetch_grok(acct):
     return {"windows": [], "note": "Grok has no usage API; limit hits are still detected"}
 
 
-def _usage_pairs(obj, path="", out=None):
-    """Best-effort: find {used, limit} pairs in an unknown JSON response."""
-    out = [] if out is None else out
-    if isinstance(obj, dict):
-        lim = next((obj[k] for k in ("limit", "hardLimit", "includedLimit") if isinstance(obj.get(k), (int, float))), None)
-        used = next((obj[k] for k in ("used", "usage", "totalSpend", "includedSpend", "spend") if isinstance(obj.get(k), (int, float))), None)
-        if lim and used is not None:
-            out.append({"label": (path.split(".")[-1] or "plan")[:4], "pct": 100 * used / lim, "reset": None})
-        for k, v in obj.items():
-            _usage_pairs(v, f"{path}.{k}" if path else k, out)
-    return out
+def cursor_rpc(token, method):
+    return http_json(f"https://api2.cursor.sh/aiserver.v1.DashboardService/{method}",
+                     {"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                      "Connect-Protocol-Version": "1"}, body={})
+
+
+def cursor_email(acct):
+    if acct.get("email"):
+        return acct["email"]
+    try:
+        r = subprocess.run([binary_for("cursor"), "status", "--format", "json"], capture_output=True, text=True,
+                           env=env_for(acct), timeout=20)
+        return (json.loads(r.stdout).get("userInfo") or {}).get("email")
+    except Exception:
+        return None
 
 
 def fetch_cursor(acct):
@@ -420,13 +424,37 @@ def fetch_cursor(acct):
     if acct.get("keyed"):
         return {"windows": [], "note": "API-key account; Cursor only reports usage for browser logins"}
     try:
-        u = http_json("https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
-                      {"Authorization": "Bearer " + token, "Content-Type": "application/json",
-                       "Connect-Protocol-Version": "1"}, body={})
+        u = cursor_rpc(token, "GetCurrentPeriodUsage")
     except urllib.error.HTTPError as e:
-        return {"windows": [], "note": f"usage unavailable (HTTP {e.code})"}
-    windows = _usage_pairs(u)[:2]
-    return {"windows": windows, "note": None if windows else "usage format not recognized"}
+        return {"error": "login expired, press l to log in again" if e.code == 401 else f"usage unavailable (HTTP {e.code})"}
+    pu = u.get("planUsage") or {}
+    lim, rem = pu.get("limit"), pu.get("remaining")
+    pct = pu.get("totalPercentUsed")
+    if pct is None and lim:
+        pct = 100 * (lim - (rem or 0)) / lim
+    end = str(u.get("billingCycleEnd") or "")
+    windows = [{"label": "mo", "pct": float(pct), "reset": int(end) / 1000 if end.isdigit() else None}] \
+        if pct is not None else []
+    plan = []
+    try:
+        name = (cursor_rpc(token, "GetPlanInfo").get("planInfo") or {}).get("planName")
+        if name:
+            plan.append(name)
+    except Exception:
+        pass
+    out = {"windows": windows, "email": cursor_email(acct)}
+    try:
+        bal = cursor_rpc(token, "GetCreditGrantsBalance")
+        cents = int(bal.get("creditBalanceCents") or 0)
+        if bal.get("hasCreditGrants") and cents > 0:
+            plan.append(f"${cents / 100:.2f} credits")
+            out["extra"] = True
+    except Exception:
+        pass
+    out["plan"] = ", ".join(plan)
+    if not windows:
+        out["note"] = "Cursor returned no plan usage"
+    return out
 
 
 def fetch_opencode(acct):
