@@ -140,6 +140,7 @@ codespace t3 providers          # preview native account mappings
 codespace t3 providers --apply  # add missing provider instances on this host
 codespace t3 scan
 codespace t3 import-project PROJECT_ID
+codespace t3 import-cwd /absolute/path/to/project
 codespace on mini t3 scan
 ```
 
@@ -161,6 +162,10 @@ configured provider instances. It requires Node 22+ for native WebSocket support
 through stdin and a single-use WebSocket ticket, not command-line arguments. Discovery can take
 several minutes when provider history is stored on a network drive. `t3_timeout_seconds` in the
 Codespace config controls the request deadline (default 180 seconds, maximum 1800).
+
+`import-cwd` creates or reuses the T3 project for a local workspace and imports its native CLI
+history with a workspace identity guard. It does not start an agent turn. Use it after stopping
+CLI sessions for that workspace; this currently remains an explicit operation.
 
 ### Dispatch an agent directly into T3
 

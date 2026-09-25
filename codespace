@@ -607,6 +607,25 @@ def t3_wait(args, base, token):
         time.sleep(min(2, max(0, deadline - time.monotonic())))
 
 
+def t3_import_cwd(path, base, token):
+    import hashlib
+    import datetime
+    cwd = str(Path(path).expanduser().resolve())
+    if not Path(cwd).is_dir():
+        raise ValueError("workspace must exist on the execution host")
+    snapshot = t3_http(base, token, "/api/orchestration/shell")
+    project = next((p for p in snapshot["projects"] if os.path.realpath(p["workspaceRoot"]) == cwd), None)
+    project_id = project["id"] if project else "codespace-" + hashlib.sha256(cwd.encode()).hexdigest()[:32]
+    if not project:
+        t3_http(base, token, "/api/orchestration/dispatch", {
+            "type": "project.create", "commandId": "codespace-project-" + project_id,
+            "projectId": project_id, "title": Path(cwd).name or cwd, "workspaceRoot": cwd,
+            "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")})
+    result = t3_rpc_value(base, token, "agentSessions.import", {
+        "projectId": project_id, "expectedWorkspaceRoot": cwd})
+    return {"projectId": project_id, "workspaceRoot": cwd, **result}
+
+
 def t3(args, quiet=False):
     """Call the T3 instance on the execution host; never relocate native logins."""
     import urllib.error
@@ -622,9 +641,10 @@ def t3(args, quiet=False):
         return subprocess.call([require("code"), "thread-export", *export_args, "--deliver-t3"])
     starting = args[:1] == ["start"]
     waiting = args[:1] == ["wait"]
+    importing_cwd = len(args) == 2 and args[0] == "import-cwd"
     inspecting = len(args) == 2 and args[0] in ("status", "stop")
     provider_sync = args in (["providers"], ["providers", "--apply"])
-    native = starting or waiting or inspecting or provider_sync or args == ["scan"] or (len(args) == 2 and args[0] == "import-project")
+    native = starting or waiting or importing_cwd or inspecting or provider_sync or args == ["scan"] or (len(args) == 2 and args[0] == "import-project")
     if args != ["_receive"] and not native:
         raise SystemExit("usage: codespace t3 scan | providers [--apply] | import-project ID | import ACCOUNT SESSION [--stopped] [--model MODEL]")
     settings = config()
@@ -649,6 +669,12 @@ def t3(args, quiet=False):
         return t3_start(args[1:], base, token)
     if waiting:
         return t3_wait(args[1:], base, token)
+    if importing_cwd:
+        result = t3_import_cwd(args[1], base, token)
+        if quiet:
+            return result
+        print(json.dumps(result, indent=2))
+        return 0
     if inspecting:
         import urllib.parse
         if args[0] == "status":
@@ -996,6 +1022,7 @@ codespace t3 renew             renew a managed token when due
 codespace t3 providers [--apply] map Code accounts into this host’s T3
 codespace t3 scan             discover native sessions using installed T3
 codespace t3 import-project ID import native history into an existing T3 project
+codespace t3 import-cwd PATH   create/reuse a T3 project and import native CLI history
 codespace t3 import ...       import one stopped session (preview bridge required)
 codespace sync [status]        publish or inspect nonsecret machine/provider profiles
 codespace update [--install | --rollback | --status] manage paired CLI releases
