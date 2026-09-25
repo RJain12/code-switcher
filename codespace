@@ -631,7 +631,14 @@ def maintenance():
         result = subprocess.run([sys.executable, require("code"), "thread-sync", "--auto"],
                                 capture_output=True, text=True, timeout=950, check=True)
         return json.loads(result.stdout)
+    def keep_logins_fresh():
+        if config().get("keep_fresh") is False:
+            return {"status": "disabled"}
+        result = subprocess.run([sys.executable, require("code"), "keep-fresh"],
+                                capture_output=True, text=True, timeout=900)
+        return json.loads(result.stdout)
     for name, action in (("t3", lambda: renew_t3_connection(if_needed=True)),
+                         ("logins", keep_logins_fresh),
                          ("providers", refresh_providers), ("threads", refresh_threads), ("sync", refresh_catalog),
                          ("update", lambda: update([]))):
         try:

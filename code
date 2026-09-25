@@ -2446,6 +2446,7 @@ usage:
   code update [--self|--providers]
                                  update code-switcher and every installed agent CLI
   code doctor                    check installs, logins and configuration
+  code keep-fresh [--dry-run]    tiny official request for idle Claude/Codex logins before they lapse
   code config auto-handoff N|off after a limit hit, continue on the best account after N seconds
 
 In the picker: Enter on an account starts a new session, Enter on a thread resumes it,
@@ -2828,6 +2829,79 @@ def cmd_doctor(db):
     return 0 if ok else 1
 
 
+KEEP_FRESH_STATE = os.path.join(DATA, "keep-fresh.json")
+# Claude Code refreshes only an expired access token; Codex refreshes when its last refresh is 8+ days old.
+# A tiny request through the official CLI at those points rotates the refresh token before it can lapse.
+CLAUDE_IDLE_AFTER_EXPIRY = 12 * 3600
+CODEX_REFRESH_AGE = 8 * 86400 + 3600
+KEEP_FRESH_RETRY = 6 * 3600
+
+
+def keep_fresh_reason(acct, now):
+    """Why an account needs a refreshing request now, or None."""
+    if acct["provider"] == "claude" and not acct.get("keyed"):
+        creds = claude_creds(acct) or {}
+        if not creds.get("refreshToken") or not creds.get("expiresAt"):
+            return None
+        idle = now - creds["expiresAt"] / 1000
+        return f"access token expired {idle / 3600:.0f}h ago" if idle > CLAUDE_IDLE_AFTER_EXPIRY else None
+    if acct["provider"] == "codex":
+        auth = codex_auth(acct) or {}
+        if not (auth.get("tokens") or {}).get("refresh_token") or not auth.get("last_refresh"):
+            return None
+        age = now - iso_ts(auth["last_refresh"])
+        return f"last refreshed {age / 86400:.1f}d ago" if age > CODEX_REFRESH_AGE else None
+    return None
+
+
+def keep_fresh_command(acct):
+    prompt = "Reply with exactly: OK"
+    if acct["provider"] == "claude":
+        return [binary_for("claude") or "claude", "-p", prompt, "--model", "haiku", "--max-turns", "1"]
+    return [binary_for("codex") or "codex", "exec", "--skip-git-repo-check", "-s", "read-only", prompt]
+
+
+def cmd_keep_fresh(db, args):
+    import tempfile
+    dry = "--dry-run" in args
+    now = time.time()
+    try:
+        with open(KEEP_FRESH_STATE) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    results = {}
+    for acct in db["accounts"]:
+        reason = keep_fresh_reason(acct, now)
+        if reason is None:
+            results[acct["id"]] = {"status": "fresh"}
+            continue
+        if now - state.get(acct["id"], {}).get("attempted", 0) < KEEP_FRESH_RETRY:
+            results[acct["id"]] = {"status": "waiting", "reason": reason}
+            continue
+        if dry:
+            results[acct["id"]] = {"status": "would-refresh", "reason": reason}
+            continue
+        with tempfile.TemporaryDirectory() as scratch:
+            try:
+                run = subprocess.run(keep_fresh_command(acct), capture_output=True, text=True,
+                                     env=env_for(acct), cwd=scratch, timeout=180, stdin=subprocess.DEVNULL)
+                ok = run.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                ok = False
+        refreshed = ok and keep_fresh_reason(acct, time.time()) is None
+        state[acct["id"]] = {"attempted": now, "refreshed": refreshed}
+        results[acct["id"]] = {"status": "refreshed" if refreshed else "failed", "reason": reason}
+    if not dry:
+        os.makedirs(DATA, exist_ok=True)
+        tmp = KEEP_FRESH_STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, KEEP_FRESH_STATE)
+    print(json.dumps(results, indent=2))
+    return 1 if any(r["status"] == "failed" for r in results.values()) else 0
+
+
 def main():
     argv = sys.argv[1:]
     if argv[:1] in (["-V"], ["--version"], ["version"]):
@@ -2884,6 +2958,8 @@ def main():
         cmd_config(db, argv[1:])
     elif cmd == "doctor":
         sys.exit(cmd_doctor(db))
+    elif cmd == "keep-fresh":
+        sys.exit(cmd_keep_fresh(db, argv[1:]))
     elif find(db, cmd):
         sys.exit(run_session(db, find(db, cmd), argv[1:]))
     else:
