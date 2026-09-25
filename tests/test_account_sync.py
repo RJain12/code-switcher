@@ -44,6 +44,13 @@ class AccountPlan(unittest.TestCase):
         }
         self.assertEqual(self.app.account_plan(manifests)["actions"], [])
 
+    def test_keys_are_not_copied_to_a_machine_whose_keys_cannot_be_read(self):
+        manifests = {
+            "macbook": {"accounts": [account("openrouter-jev", "openrouter", "key:abc", keyed=True)]},
+            "mini": {"accounts": [account("openrouter-jev", "openrouter", None, login="unknown", keyed=True)]},
+        }
+        self.assertEqual(self.app.account_plan(manifests)["actions"], [])
+
     def test_lapsed_logins_are_flagged_for_sign_in_again(self):
         manifests = {"mini": {"accounts": [account("codex-api", "codex", "y@x/2", login="idle")]}}
         [action] = self.app.account_plan(manifests)["actions"]
@@ -121,6 +128,17 @@ class KeyTransfer(unittest.TestCase):
         self.run_import({"provider": "openrouter", "name": "jev", "key": "sk-or-1"})
         self.assertEqual(self.run_import({"provider": "openrouter", "name": "jev", "key": "sk-or-2"})["id"],
                          "openrouter-jev-2")
+
+    def test_a_locked_session_refuses_to_import_when_existing_keys_are_unreadable(self):
+        home = os.path.join(self.tmp.name, "or-keychain")
+        os.makedirs(home)
+        self.m.mutate(self.m.load_db(), lambda d: d["accounts"].append(
+            {"id": "openrouter-jev", "provider": "openrouter", "name": "jev", "home": home, "keyed": True}))
+        with patch("sys.stdin", io.StringIO(json.dumps({"provider": "openrouter", "name": "jev", "key": "sk-or-1"}))), \
+                self.assertRaises(SystemExit):
+            self.m.cmd_key_import(self.m.load_db(), [])
+        self.assertEqual([a["id"] for a in self.m.load_db()["accounts"] if a["provider"] == "openrouter"],
+                         ["openrouter-jev"])
 
     def test_only_api_key_providers_are_accepted(self):
         with patch("sys.stdin", io.StringIO(json.dumps({"provider": "codex", "name": "x", "key": "k"}))), \

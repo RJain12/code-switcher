@@ -521,10 +521,12 @@ def account_plan(manifests):
                 continue
             unverified = any(a["provider"] == group["provider"] and a["login"] == "unknown"
                              for a in manifests[alias]["accounts"])
+            if unverified:
+                continue
             if group["keyed"]:
                 actions.append({"action": "copy-key", "machine": alias, "from": source,
                                 "account": present[source]["id"]})
-            elif not unverified:
+            else:
                 actions.append({"action": "sign-in", "machine": alias, "account": present[source]["id"],
                                 "command": f"codespace accounts link {alias} {present[source]['id']}"})
     ordered = sorted(groups.values(), key=lambda g: (g["provider"], g["identity"] or ""))

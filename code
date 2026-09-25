@@ -3015,8 +3015,8 @@ def cmd_accounts_manifest(db, args):
     for acct in db["accounts"]:
         expiry = access_expiry(acct)
         login, identity = account_login(acct), account_identity(acct)
-        # Claude and Cursor browser logins live in the keychain, which SSH sessions cannot read.
-        if locked and login != "ok" and acct["provider"] in ("claude", "cursor") and not acct.get("keyed"):
+        # API keys and Claude/Cursor browser logins live in the keychain, which SSH sessions cannot read.
+        if locked and login != "ok" and (acct.get("keyed") or acct["provider"] in ("claude", "cursor")):
             login, identity = "unknown", None
         accounts.append({"id": acct["id"], "provider": acct["provider"], "name": acct["name"],
                          "keyed": bool(acct.get("keyed")), "model": acct.get("model"),
@@ -3048,10 +3048,17 @@ def cmd_key_import(db, args):
             or not isinstance(name, str) or not name.strip():
         sys.exit("code: key-import needs provider (openrouter or cursor), name and key")
     key = key.strip()
+    unreadable = False
     for acct in db["accounts"]:
-        if acct["provider"] == provider and acct.get("keyed") and key_get(acct) == key:
-            print(json.dumps({"id": acct["id"], "status": "exists"}))
-            return 0
+        if acct["provider"] == provider and acct.get("keyed"):
+            existing = key_get(acct)
+            if existing == key:
+                print(json.dumps({"id": acct["id"], "status": "exists"}))
+                return 0
+            unreadable = unreadable or existing is None
+    if unreadable and keychain_locked():
+        sys.exit("code: this session cannot read the keychain, so it cannot rule out a duplicate; "
+                 "the logged-in session will import the key")
     taken = {a["id"] for a in read_db()["accounts"]}
     base = f"{provider}-{slug(name)}"
     aid = next(candidate for candidate in [base] + [f"{base}-{n}" for n in range(2, 100)] if candidate not in taken)
