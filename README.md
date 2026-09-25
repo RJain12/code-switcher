@@ -65,6 +65,26 @@ Notes:
 - **OpenRouter** runs Claude Code through OpenRouter's Anthropic-compatible endpoint. Pick any model when you add the account, e.g. `anthropic/claude-opus-5.5`, `openai/gpt-6` or `x-ai/grok-5`, or leave it blank for Claude Code's default.
 - **Cursor and OpenCode** store sessions in SQLite databases whose format isn't published, so `code` can't watch them for limit errors yet. You can still launch them, and they can receive a conversation handed off from another agent.
 
+## Everyday use
+
+Run `code`. You'll see every account with its usage. The selected account expands to show its **5 most recent threads**:
+
+```
+ › Claude     work      you@company.com [team]
+                5h ███░░░░░░░  31% resets 2h14m     wk █████░░░░░  52% resets Fri 5am
+        now  Refactor the billing webhooks                               ~/src/api
+         2h  Why is the iOS build failing on CI?                         ~/src/app
+         1d  Add retries to the fetcher                                  ~/src/api
+```
+
+- **Start fresh:** select an account and press **Enter** for a new session on it.
+- **Resume:** move down onto a thread and press **Enter**. It reopens in the folder it was started in, with no `--resume <id>` to type.
+- **Hand off (continue a thread on a different account):** select a thread, press **`h`**, then choose the target account. Pressing `h` on an account row hands off that account's latest thread.
+  - Claude → Claude or OpenRouter reopens the same session with its full history.
+  - Anything else starts the target agent with a transcript of the conversation so far and tells it to pick up where it stopped.
+- **Automatic handoff:** when an agent launched through `code` runs out of usage mid-task, the same picker opens by itself. [Details below.](#running-out-of-usage-mid-conversation)
+- **Jev on/off:** press **`J`** in the picker, or run `code jev on` / `code jev off`. The header shows `jev on` or `jev off`.
+
 ## Usage
 
 | Command | What it does |
@@ -76,7 +96,8 @@ Notes:
 | `code best [provider] [args…]` | Launch the account with the most usage left, e.g. `code best codex` |
 | `code login <id>` | Re-run login, or replace the API key |
 | `code rm <id>` | Remove an account and delete its stored login or key |
-| `code handoff` | Move your last session, with its context, to another account |
+| `code handoff` | Move your most recent session, with its context, to another account (same as `h` in the picker) |
+| `code jev on\|off` | Let Jev choose Codex effort (same as `J` in the picker) |
 | `code effort` | Auto-effort status: recent decisions, Jev calls and cost, cache hit rate |
 | `code effort <id> on\|off` | Toggle auto-effort for a Codex account |
 | `code effort <id> range LO HI` | Keep auto-effort within a range, e.g. `low max` (default `low xhigh`) |
@@ -91,7 +112,10 @@ Keys in the picker:
 | Key | Action |
 | --- | --- |
 | `↑`/`↓` or `j`/`k` | Move the selection |
-| `Enter` or `1`–`9` | Launch an account |
+| `Enter` | New session on the selected account, or resume the selected thread |
+| `h` | Hand off the selected thread (or the account's latest thread) to another account |
+| `J` | Turn Jev on or off |
+| `1`–`9` | New session on that account |
 | `a` | Add an account |
 | `l` | Re-login the selected account |
 | `d` | Remove the selected account |

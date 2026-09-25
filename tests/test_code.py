@@ -618,6 +618,33 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("Continuing on codex-default", screen)
         self.assertTrue(any(c["bin"] == "codex" for c in self.calls()))
 
+    def seed_thread(self, title="fix the parser bug"):
+        sid = "11111111-2222-3333-4444-555555555555"
+        d = os.path.join(self.home, ".code-accounts", "claude", "a", "projects", re.sub(r"[^A-Za-z0-9]", "-", self.work))
+        os.makedirs(d)
+        with open(os.path.join(d, sid + ".jsonl"), "w") as f:
+            f.write(json.dumps({"type": "user", "cwd": self.work, "message": {"content": title}}) + "\n")
+            f.write(json.dumps({"type": "assistant", "cwd": self.work, "message": {"content": [{"type": "text", "text": "ok"}]}}) + "\n")
+        return sid
+
+    def test_enter_on_thread_resumes_it_in_its_folder(self):
+        sid = self.seed_thread()
+        screen, _ = self.drive([], [b"j", b"\r"], extra_env={"E2E_QUIET": "1"}, wait=4)
+        self.assertIn("fix the parser bug", screen)
+        c = self.calls()[0]
+        self.assertEqual(c["argv"][:2], ["--resume", sid])
+        self.assertTrue(c["home"].endswith("claude/a"))
+
+    def test_h_hands_a_thread_to_another_account(self):
+        sid = self.seed_thread()
+        screen, full = self.drive([], [b"j", b"h", b"\r"], extra_env={"E2E_QUIET": "1"}, wait=4)
+        self.assertIn("Continue", full)
+        c = self.calls()[0]
+        self.assertTrue(c["home"].endswith("claude/b"), "should launch on the other Claude account")
+        self.assertEqual(c["argv"][:2], ["--resume", sid])
+        copied = [f for _, _, fs in os.walk(c["home"]) for f in fs]
+        self.assertIn(sid + ".jsonl", copied)
+
     def test_normal_exit_does_not_open_picker(self):
         screen, full = self.drive(["claude-a"], [], extra_env={"E2E_QUIET": "1"}, wait=4)
         self.assertNotIn("hit its usage limit", full)

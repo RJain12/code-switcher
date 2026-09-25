@@ -1301,15 +1301,16 @@ class NotInstalled(Exception):
         super().__init__(f"{label(acct)} isn't installed. Install it with:\n  {prov(acct)['install']}")
 
 
-def supervise(db, acct, args, handoff=None):
+def supervise(db, acct, args, handoff=None, cwd=None, session_id=None):
     binary = binary_for(acct["provider"])
     if not binary:
         raise NotInstalled(acct)
-    cwd = handoff["cwd"] if handoff and os.path.isdir(handoff.get("cwd") or "") else os.getcwd()
-    resumed = False
+    want = handoff["cwd"] if handoff else cwd
+    cwd = want if want and os.path.isdir(want) else os.getcwd()
+    resumed = bool(session_id)
     if handoff:
         args, session_id, resumed = prepare_handoff(acct, handoff)
-    else:
+    elif not session_id:
         args, session_id = fresh_session_args(acct, args)
     proxy = None
     if auto_effort_ok(acct, args):
@@ -1374,10 +1375,10 @@ def notify(title, text):
         subprocess.run(["notify-send", title, text], capture_output=True, timeout=5)
 
 
-def run_session(db, acct, args, handoff=None):
+def run_session(db, acct, args, handoff=None, cwd=None, session_id=None):
     while True:
         try:
-            rc, hit, session = supervise(db, acct, args, handoff)
+            rc, hit, session = supervise(db, acct, args, handoff, cwd, session_id)
         except NotInstalled as e:
             print(e, file=sys.stderr)
             return 127
@@ -1396,7 +1397,7 @@ def run_session(db, acct, args, handoff=None):
         if not nxt:
             print("Session saved. Continue it on another account later with: code handoff")
             return rc
-        acct, args, handoff = nxt, [], session
+        acct, args, handoff, cwd, session_id = nxt, [], session, None, None
 
 
 def prompt_args(target, prompt):
@@ -1574,6 +1575,150 @@ def export_transcript(h, src):
     return out
 
 
+# ---------- recent threads ----------
+
+def fmt_ago(ts):
+    d = max(0, time.time() - (ts or 0))
+    return "now" if d < 60 else f"{int(d // 60)}m" if d < 3600 else f"{int(d // 3600)}h" if d < 86400 else f"{int(d // 86400)}d"
+
+
+def short_path(p):
+    return ("~" + p[len(HOME):]) if p and p.startswith(HOME) else (p or "")
+
+
+def one_line(s, n=90):
+    s = re.sub(r"<[^>]+>[\s\S]*?</[^>]+>", " ", s or "")
+    s = " ".join(s.split())
+    return s[:n - 1] + "…" if len(s) > n else s
+
+
+def read_edges(path, head=65536, tail=262144):
+    """First and last chunk of a (possibly huge) JSONL file, as parsed rows."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        first = f.read(head)
+        if size > head:
+            f.seek(max(head, size - tail))
+            last = f.read()
+        else:
+            last = b""
+    rows = []
+    for chunk, drop_first in ((first, False), (last, True)):
+        lines = chunk.split(b"\n")
+        if drop_first and lines:
+            lines = lines[1:]  # likely cut mid-line
+        for line in lines:
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                pass
+    return rows
+
+
+def claude_threads(acct, n):
+    files = sorted(glob.glob(os.path.join(home_of(acct), "projects", "*", "*.jsonl")), key=os.path.getmtime, reverse=True)
+    out = []
+    for f in files[:n * 3]:
+        rows = read_edges(f)
+        cwd = next((r.get("cwd") for r in rows if r.get("cwd")), None)
+        first = None
+        titles = {}
+        for r in rows:
+            t = r.get("type")
+            if t in ("custom-title", "ai-title"):
+                titles[t] = r.get("customTitle") or r.get("aiTitle") or r.get("title")
+            elif t == "last-prompt":
+                titles["last"] = r.get("lastPrompt")
+            elif t == "user" and not first and not r.get("isMeta") and not r.get("isSidechain"):
+                text = " ".join(x for k, x in content_parts((r.get("message") or {}).get("content")) if k == "text")
+                if text.strip() and not text.lstrip().startswith(NOISE):
+                    first = text
+        title = titles.get("custom-title") or titles.get("ai-title") or first or titles.get("last")
+        if not title:
+            continue  # empty or tool-only session
+        out.append({"id": os.path.basename(f)[:-len(".jsonl")], "title": one_line(title), "cwd": cwd,
+                    "updated": os.path.getmtime(f), "path": f})
+        if len(out) == n:
+            break
+    return out
+
+
+def codex_threads(acct, n):
+    import sqlite3
+    dbs = sorted(glob.glob(os.path.join(home_of(acct), "state_*.sqlite")),
+                 key=lambda p: int(re.findall(r"\d+", os.path.basename(p))[-1]))
+    if dbs:
+        try:
+            con = sqlite3.connect(f"file:{dbs[-1]}?mode=ro", uri=True, timeout=1)
+            try:
+                rows = con.execute(
+                    "select id, rollout_path, updated_at, cwd, title, first_user_message from threads "
+                    "where archived = 0 and source in ('cli', 'vscode') order by updated_at desc limit ?", (n,)).fetchall()
+            finally:
+                con.close()
+            return [{"id": r[0], "path": r[1], "updated": r[2], "cwd": r[3], "title": one_line(r[4] or r[5] or "(untitled)")}
+                    for r in rows]
+        except sqlite3.Error:
+            pass  # schema changed: fall back to the rollout files
+    files = sorted(glob.glob(os.path.join(home_of(acct), "sessions", "*", "*", "*", "rollout-*.jsonl")), reverse=True)
+    out = []
+    for f in files[:n * 3]:
+        meta, first = {}, None
+        for r in read_edges(f, tail=0):
+            p = r.get("payload") or {}
+            if r.get("type") == "session_meta":
+                meta = p
+            elif r.get("type") == "response_item" and p.get("type") == "message" and p.get("role") == "user" and not first:
+                text = item_text(p)
+                if text.strip() and not text.lstrip().startswith(NOISE):
+                    first = text
+        if meta.get("id") and first:
+            out.append({"id": meta["id"], "path": f, "cwd": meta.get("cwd"), "updated": os.path.getmtime(f),
+                        "title": one_line(first)})
+        if len(out) == n:
+            break
+    return out
+
+
+def grok_threads(acct, n):
+    dirs = sorted(glob.glob(os.path.join(home_of(acct), "sessions", "*", "*", "")), key=os.path.getmtime, reverse=True)
+    out = []
+    for d in dirs[:n]:
+        summary = {}
+        try:
+            with open(os.path.join(d, "summary.json")) as f:
+                summary = json.load(f)
+        except (OSError, ValueError):
+            pass
+        first = next((s for k, s in grok_entries(os.path.join(d, "updates.jsonl")) if k == "user"), None)
+        title = summary.get("title") or summary.get("summary") or first
+        out.append({"id": os.path.basename(os.path.dirname(d)), "path": os.path.join(d, "updates.jsonl"),
+                    "cwd": summary.get("cwd"), "updated": os.path.getmtime(d), "title": one_line(title or "(untitled)")})
+    return out
+
+
+THREADS = {"claude": claude_threads, "codex": codex_threads, "grok": grok_threads}
+
+
+def recent_threads(acct, n=5):
+    try:
+        return THREADS.get(prov(acct)["engine"], lambda a, k: [])(acct, n)
+    except Exception:
+        return []
+
+
+def resume_args(acct, thread):
+    engine = prov(acct)["engine"]
+    if engine == "codex":
+        return ["resume", thread["id"]]
+    return ["--resume", thread["id"]]
+
+
+def thread_handoff(acct, thread):
+    return {"provider": acct["provider"], "account": acct["id"], "home": home_of(acct), "path": thread.get("path"),
+            "session_id": thread["id"], "cwd": thread.get("cwd") or os.getcwd(), "ended": time.time()}
+
+
 # ---------- picker UI ----------
 
 def fmt_reset(ts):
@@ -1597,25 +1742,36 @@ def headroom(info):
 
 
 def picker(stdscr, db, usage, state, handoff=None):
+    """Returns (mode, account, thread): mode is new|resume|handoff|add|login|quit."""
     curses.curs_set(0)
     curses.use_default_colors()
     for i, c in enumerate((curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_CYAN,
                            curses.COLOR_MAGENTA, curses.COLOR_BLUE), 1):
         curses.init_pair(i, c, -1)
     GREEN, YELLOW, RED, CYAN, MAG, BLUE = (curses.color_pair(i) for i in range(1, 7))
-    DIM, BOLD = curses.A_DIM, curses.A_BOLD
+    DIM, BOLD, REV = curses.A_DIM, curses.A_BOLD, curses.A_REVERSE
     PCOLOR = {"claude": MAG, "codex": GREEN, "openrouter": CYAN, "grok": 0, "cursor": YELLOW, "opencode": BLUE}
     installed = {p: bool(binary_for(p)) for p in PROVIDERS}
+    threads = state.setdefault("threads", {})
+    stdscr.clear()  # full repaint: don't leave the previous screen's text behind
     stdscr.timeout(250)
 
     def visible():
         return [a for a in db["accounts"] if not handoff or a["id"] != handoff["exclude"]]
 
+    def threads_of(a):
+        if handoff:
+            return []  # choosing a target account, not a thread
+        if a["id"] not in threads:
+            threads[a["id"]] = recent_threads(a)
+        return threads[a["id"]]
+
     accts = visible()
     ids = [a["id"] for a in accts]
-    sel = ids.index(db["last"]) if db.get("last") in ids and not handoff else 0
+    ai = ids.index(db["last"]) if db.get("last") in ids and not handoff else 0
+    ti = -1  # -1 = the account row itself, else index into its threads
     auto_sel = bool(handoff)  # in handoff mode, follow the best account until the user moves
-    message, offset = "", 0
+    message, scroll = "", 0
     deadline = time.time() + handoff["auto_seconds"] if handoff and handoff.get("auto_seconds") else None
 
     def color_for(p):
@@ -1623,9 +1779,9 @@ def picker(stdscr, db, usage, state, handoff=None):
 
     while True:
         accts = visible()
-        sel = min(sel, max(0, len(accts) - 1))
-        stdscr.erase()
+        ai = min(ai, max(0, len(accts) - 1))
         h, w = stdscr.getmaxyx()
+        stdscr.erase()
 
         def put(y, x, text, attr=0):
             if 0 <= y < h and x < w - 1:
@@ -1639,133 +1795,188 @@ def picker(stdscr, db, usage, state, handoff=None):
             put(0, 0, "terminal too small for code; enlarge it (q quits)")
             stdscr.refresh()
             if stdscr.getch() in (ord("q"), 27):
-                return ("quit", None)
+                return ("quit", None, None)
             continue
 
-        top = 2
+        best = min(accts, key=lambda a: headroom(usage.get(a["id"])), default=None)
+        best_id = best["id"] if best and headroom(usage.get(best["id"])) < 100 else None
+        if auto_sel and best_id:
+            ai, ti = [a["id"] for a in accts].index(best_id), -1
+        jev_on = bool((db.get("jev") or {}).get("enabled"))
+
+        # header
         if handoff:
             put(0, 2, handoff["title"], BOLD | YELLOW)
             put(1, 2, "Enter continues with the full conversation · q stops here", DIM)
             top = 3
-            keys = "enter continue  a add  l re-login  r refresh  q quit"
+            keys = "enter continue  a add  l login  r refresh  q quit"
         else:
-            put(0, 2, "code", BOLD | CYAN)
-            put(0, 7, "pick an account to launch", DIM)
-            keys = "enter launch  a add  d remove  l re-login  e auto-effort  r refresh  q quit"
-        put(h - 1, 2, keys, DIM)
-        if message:
-            put(h - 2, 2, message, YELLOW)
+            x = put(0, 2, "code", BOLD | CYAN)
+            x = put(0, x + 1, "↑↓ pick an account or a recent thread", DIM)
+            put(0, x + 3, f"jev {'on' if jev_on else 'off'}", (GREEN if jev_on else DIM) | BOLD)
+            top = 2
+            keys = "enter new/resume  h hand off  J jev  e effort  a add  d remove  l login  r refresh  q quit"
         status = "refreshing…" if state["loading"] else (state.get("update") or "")
         if status:
             put(0, max(2, w - len(status) - 2), status, DIM if state["loading"] else YELLOW)
-
-        if not accts:
-            put(top, 4, "No other accounts. Press 'a' to add one." if handoff else "No accounts yet. Press 'a' to add one.")
-        best = min(accts, key=lambda a: headroom(usage.get(a["id"])), default=None)
-        best_id = best["id"] if best and headroom(usage.get(best["id"])) < 100 else None
-        if auto_sel and best_id:
-            sel = [a["id"] for a in accts].index(best_id)
+        put(h - 1, 2, keys, DIM)
         if deadline and best_id:
             left = deadline - time.time()
             if left <= 0:
-                return ("launch", next(a for a in accts if a["id"] == best_id))
+                return ("new", next(a for a in accts if a["id"] == best_id), None)
             put(h - 2, 2, f"Continuing on {best_id} in {int(left) + 1}s. Press any key to choose yourself.", GREEN | BOLD)
+        elif message:
+            put(h - 2, 2, message, YELLOW)
 
-        rows = max(1, (h - top - 2) // 3)
-        offset = min(max(offset, sel - rows + 1), sel)
-        offset = max(0, min(offset, max(0, len(accts) - rows)))
-        if offset:
-            put(top - 1, w - 12, f"↑ {offset} more", DIM)
-
+        # build lines: (segments, selectable?) for every account; threads under the selected one
+        lines, sel_line = [], 0
         name_w = max([len(a["name"]) for a in accts] + [7])
         ind = 15
-        y = top
-        for i in range(offset, min(len(accts), offset + rows)):
-            a = accts[i]
+        for i, a in enumerate(accts):
             info = usage.get(a["id"])
-            is_sel = i == sel
-            put(y, 1, "›" if is_sel else " ", BOLD | CYAN)
-            x = put(y, 3, f"{label(a):<10}", PCOLOR[a["provider"]] | BOLD)
-            x = put(y, x + 1, f"{a['name']:<{name_w}}", BOLD if is_sel else 0)
+            on_acct = i == ai and ti == -1
+            if on_acct:
+                sel_line = len(lines)
+            segs = [(1, "›" if on_acct else " ", BOLD | CYAN), (3, f"{label(a):<10}", PCOLOR[a["provider"]] | BOLD),
+                    (14, f"{a['name']:<{name_w}}", BOLD if i == ai else 0)]
+            x = 16 + name_w
             email = (info or {}).get("email") or a.get("email") or ""
             plan = (info or {}).get("plan") or ""
-            x = put(y, x + 2, email, DIM)
+            extra = []
+            if email:
+                extra.append((email, DIM))
             if plan:
-                x = put(y, x + 1, f"[{plan}]", DIM)
+                extra.append((f"[{plan}]", DIM))
             if a["provider"] == "codex" and a.get("auto_effort", True):
-                x = put(y, x + 1, "⚡auto-effort" + ("+jev" if (db.get("jev") or {}).get("enabled") else ""), CYAN)
+                extra.append(("⚡auto-effort" + ("+jev" if jev_on else ""), CYAN))
             if a["id"] == best_id and len(accts) > 1:
-                put(y, x + 1, "★ most headroom", GREEN)
-            y += 1
+                extra.append(("★ most headroom", GREEN))
+            for text, attr in extra:
+                segs.append((x, text, attr))
+                x += len(text) + 1
+            lines.append(segs)
             if not installed[a["provider"]]:
-                put(y, ind, f"not installed · {prov(a)['install']}", RED)
+                usage_segs = [(ind, f"not installed · {prov(a)['install']}", RED)]
             elif info is None:
-                put(y, ind, "loading usage…", DIM)
+                usage_segs = [(ind, "loading usage…", DIM)]
             elif info.get("error"):
-                put(y, ind, info["error"], RED)
+                usage_segs = [(ind, info["error"], RED)]
             elif not info.get("windows"):
-                put(y, ind, info.get("note") or "no limit data", DIM)
+                usage_segs = [(ind, info.get("note") or "no limit data", DIM)]
             else:
-                x = ind
+                usage_segs, x = [], ind
                 for win in info["windows"]:
                     pct = win["pct"]
                     filled = int(round(min(pct, 100) / 10))
-                    x = put(y, x, f"{win['label']:>4} ", DIM)
-                    x = put(y, x, "█" * filled, color_for(pct))
-                    x = put(y, x, "░" * (10 - filled), DIM)
-                    x = put(y, x, f" {pct:3.0f}%", color_for(pct) | BOLD)
                     r = fmt_reset(win.get("reset"))
-                    x = put(y, x, f" resets {r}" if r else "", DIM)
+                    for text, attr in ((f"{win['label']:>4} ", DIM), ("█" * filled, color_for(pct)),
+                                       ("░" * (10 - filled), DIM), (f" {pct:3.0f}%", color_for(pct) | BOLD),
+                                       (f" resets {r}" if r else "", DIM)):
+                        usage_segs.append((x, text, attr))
+                        x += len(text)
                     x += 3
                 if info.get("extra"):
-                    x = put(y, x, "+extra usage", CYAN) + 3
+                    usage_segs.append((x, "+extra usage", CYAN))
+                    x += 15
                 if info.get("resets"):
-                    put(y, x, f"↺ {info['resets']} reset{'s' if info['resets'] != 1 else ''} banked", CYAN)
-            y += 2
-        if offset + rows < len(accts):
-            put(y - 1, 3, f"↓ {len(accts) - offset - rows} more", DIM)
+                    usage_segs.append((x, f"↺ {info['resets']} reset{'s' if info['resets'] != 1 else ''} banked", CYAN))
+            lines.append(usage_segs)
+            if i == ai and installed[a["provider"]]:
+                ts = threads_of(a)
+                for j, t in enumerate(ts):
+                    on = ti == j
+                    if on:
+                        sel_line = len(lines)
+                    where = short_path(t.get("cwd"))
+                    lines.append([(5, "›" if on else " ", BOLD | CYAN), (7, f"{fmt_ago(t['updated']):>4}", DIM),
+                                  (13, t["title"][: max(10, w - 16 - min(len(where), 28))], (REV if on else 0)),
+                                  (max(14, w - 2 - min(len(where), 28)), where[-28:], DIM)])
+                if not ts and not handoff and prov(a)["engine"] in THREADS:
+                    lines.append([(7, "no recent threads", DIM)])
+            lines.append([])
+        if not accts:
+            lines.append([(4, "No other accounts. Press 'a' to add one." if handoff else "No accounts yet. Press 'a' to add one.", 0)])
+
+        room = h - top - 2
+        scroll = min(max(scroll, sel_line - room + 3), max(0, sel_line - 1))
+        scroll = max(0, min(scroll, max(0, len(lines) - room)))
+        if scroll:
+            put(top - 1, w - 10, "↑ more", DIM)
+        for k, segs in enumerate(lines[scroll:scroll + room]):
+            for x, text, attr in segs:
+                put(top + k, x, text, attr)
+        if scroll + room < len(lines):
+            put(h - 3, w - 10, "↓ more", DIM)
         stdscr.refresh()
 
         k = stdscr.getch()
         if k == -1:
             continue
-        deadline = None
-        message = ""
+        deadline, message = None, ""
+        cur = accts[ai] if accts else None
+        ts = threads_of(cur) if cur and installed[cur["provider"]] else []
         if k in (ord("q"), 27):
-            return ("quit", None)
+            return ("quit", None, None)
         if k in (curses.KEY_UP, ord("k")) and accts:
-            sel, auto_sel = (sel - 1) % len(accts), False
+            auto_sel = False
+            if ti >= 0:
+                ti -= 1
+            else:
+                ai = (ai - 1) % len(accts)
         elif k in (curses.KEY_DOWN, ord("j")) and accts:
-            sel, auto_sel = (sel + 1) % len(accts), False
-        elif ord("1") <= k <= ord("9") and offset + k - ord("1") < len(accts):
-            return ("launch", accts[offset + k - ord("1")])
+            auto_sel = False
+            if ti + 1 < len(ts):
+                ti += 1
+            else:
+                ai, ti = (ai + 1) % len(accts), -1
+        elif ord("1") <= k <= ord("9") and k - ord("1") < len(accts):
+            return ("new", accts[k - ord("1")], None)
         elif k in (10, 13, curses.KEY_ENTER) and accts:
-            return ("launch", accts[sel])
+            return ("resume", cur, ts[ti]) if ti >= 0 else ("new", cur, None)
+        elif k == ord("h") and accts and not handoff:
+            t = ts[ti] if ti >= 0 else (ts[0] if ts else None)
+            if not t:
+                message = f"'{cur['name']}' has no recent thread to hand off."
+            elif len(db["accounts"]) < 2:
+                message = "Add another account first (press a), then hand the thread to it."
+            else:
+                return ("handoff", cur, t)
+        elif k == ord("J") and not handoff:
+            if jev_on:
+                mutate(db, lambda d: d.update(jev={**(d.get("jev") or {}), "enabled": False}))
+                message = "Jev off: auto-effort uses the local heuristic."
+            else:
+                acct_id = (db.get("jev") or {}).get("account") or next(
+                    (a["id"] for a in db["accounts"] if a["provider"] == "openrouter"), None)
+                if not acct_id and not os.environ.get("OPENROUTER_API_KEY"):
+                    message = "Jev needs an OpenRouter key: press a and add an OpenRouter account first."
+                else:
+                    mutate(db, lambda d: d.update(jev={"enabled": True, "account": acct_id}))
+                    message = f"Jev on (key from {acct_id or 'OPENROUTER_API_KEY'}); applies to new Codex sessions."
         elif k == ord("a"):
-            return ("add", None)
+            return ("add", None, None)
         elif k == ord("l") and accts:
-            return ("login", accts[sel])
+            return ("login", cur, None)
         elif k == ord("r"):
+            threads.clear()
             state["refresh"]()
-        elif k == ord("e") and accts:
-            a = accts[sel]
-            if a["provider"] != "codex":
+        elif k == ord("e") and accts and not handoff:
+            if cur["provider"] != "codex":
                 message = "Auto-effort is Codex-only: other providers lose the prompt cache when effort changes."
             else:
-                a = update_acct(db, a["id"], auto_effort=not a.get("auto_effort", True))
+                a = update_acct(db, cur["id"], auto_effort=not cur.get("auto_effort", True))
                 message = f"Auto-effort {'on' if a['auto_effort'] else 'off'} for '{a['name']}'."
-        elif k == ord("d") and accts and not handoff:
-            a = accts[sel]
-            if not a["home"] and not a.get("keyed"):
+        elif k == ord("d") and accts and not handoff and ti == -1:
+            if not cur["home"] and not cur.get("keyed"):
                 message = "Default accounts are your normal logins and can't be removed here."
                 continue
-            put(h - 2, 2, f"Remove {label(a)} '{a['name']}' and delete its login? (y/N) ", RED | BOLD)
+            put(h - 2, 2, f"Remove {label(cur)} '{cur['name']}' and delete its login? (y/N) ", RED | BOLD)
             stdscr.timeout(-1)
             ans = stdscr.getch()
             stdscr.timeout(250)
             if ans in (ord("y"), ord("Y")):
-                remove_account(db, a)
-                message = f"Removed '{a['name']}'."
+                remove_account(db, cur)
+                message = f"Removed '{cur['name']}'."
 
 
 def version_tuple(v):
@@ -1792,7 +2003,7 @@ def check_for_update(cache, state, lock):
 
 
 def pick(db, handoff=None):
-    """Show the picker until an account is chosen (returned) or the user quits (None)."""
+    """Picker loop. Normal mode returns (mode, account, thread) or None; handoff mode returns an account or None."""
     while True:
         cache = load_cache()
         usage = {a["id"]: cache[a["id"]] for a in db["accounts"] if a["id"] in cache}
@@ -1819,7 +2030,7 @@ def pick(db, handoff=None):
         state["refresh"] = refresh
         refresh(force=False)
         threading.Thread(target=check_for_update, args=(cache, state, lock), daemon=True).start()
-        action, acct = curses.wrapper(picker, db, usage, state, handoff)
+        mode, acct, thread = curses.wrapper(picker, db, usage, state, handoff)
 
         with lock:
             cache.update({k: v for k, v in usage.items() if v.get("error") != "not logged in"})
@@ -1827,16 +2038,16 @@ def pick(db, handoff=None):
             if emails:
                 mutate(db, lambda d: [a.update(email=emails[a["id"]]) for a in d["accounts"] if a["id"] in emails])
 
-        if action == "quit":
+        if mode == "quit":
             return None
-        if action == "launch":
+        if mode in ("new", "resume", "handoff"):
             if binary_for(acct["provider"]) or ensure_installed(acct["provider"]):
-                return acct
+                return acct if handoff else (mode, acct, thread)
             input("\nPress enter to return to the picker…")
-        if action == "add":
+        if mode == "add":
             add_account(db)
             input("\nPress enter to return to the picker…")
-        if action == "login":
+        if mode == "login":
             relogin(db, acct)
             input("\nPress enter to return to the picker…")
 
@@ -1849,9 +2060,18 @@ def need_tty():
 def run_picker(args):
     need_tty()
     db = load_db()
-    acct = pick(db)
-    if acct:
+    choice = pick(db)
+    if not choice:
+        return
+    mode, acct, thread = choice
+    if mode == "new":
         sys.exit(run_session(db, acct, args))
+    if mode == "resume":
+        sys.exit(run_session(db, acct, resume_args(acct, thread) + args, cwd=thread.get("cwd"), session_id=thread["id"]))
+    h = thread_handoff(acct, thread)
+    target = pick(db, {"exclude": acct["id"], "title": f"Continue “{one_line(thread['title'], 50)}” on:"})
+    if target:
+        sys.exit(run_session(db, target, [], handoff=h))
 
 
 def handoff_last(db):
@@ -1873,7 +2093,7 @@ def handoff_last(db):
 HELP = f"""code {VERSION}: pick an AI coding agent account and launch it
 
 usage:
-  code [-- args...]              open the picker; extra args are passed to the agent
+  code [-- args...]              open the picker (accounts + their recent threads)
   code <id> [args...]            launch an account directly (e.g. code claude-work)
   code best [provider] [args...] launch the account with the most usage left
   code add [provider] [name]     link an account (claude, codex, openrouter, grok, cursor, opencode)
@@ -1881,6 +2101,7 @@ usage:
   code login <id>                re-run login (or replace the API key) for an account
   code rm <id>                   remove an account
   code handoff                   move your last session (with its context) to another account
+  code jev on|off                let Jev choose Codex effort (same as J in the picker)
   code effort                    auto-effort status, recent decisions, Jev cost and cache hit rate
   code effort <id> on|off        toggle auto-effort for a Codex account
   code effort <id> range LO HI   limit auto-effort to a range (e.g. low max)
@@ -1890,6 +2111,9 @@ usage:
                                  update code-switcher and every installed agent CLI
   code doctor                    check installs, logins and configuration
   code config auto-handoff N|off after a limit hit, continue on the best account after N seconds
+
+In the picker: Enter on an account starts a new session, Enter on a thread resumes it,
+h on a thread continues it on another account (handoff), J toggles Jev.
 
 Agents launched through `code` are watched: if the account hits its usage limit, the agent is
 closed and you pick another account to continue the same conversation on.
@@ -1976,6 +2200,10 @@ def effort_stats():
 
 def cmd_effort(db, argv):
     if argv[:1] == ["jev"]:
+        if argv[1:2] not in (["on"], ["off"]):
+            jev = db.get("jev") or {}
+            print(f"Jev is {'on' if jev.get('enabled') else 'off'}. Toggle with `code jev on|off` or press J in the picker.")
+            return
         if argv[1:2] == ["off"]:
             mutate(db, lambda d: d.update(jev={"enabled": False}))
             print("Jev off: auto-effort uses the local heuristic.")
@@ -2155,6 +2383,8 @@ def main():
         handoff_last(db)
     elif cmd == "effort":
         cmd_effort(db, argv[1:])
+    elif cmd == "jev":
+        cmd_effort(db, ["jev"] + (argv[1:] or ["status"]))
     elif cmd == "best":
         cmd_best(db, argv[1:])
     elif cmd == "config":
