@@ -6,9 +6,12 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
+import datetime
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 from test_code import load, ROOT
 
@@ -80,21 +83,73 @@ class T3Bridge(unittest.TestCase):
         self.client.CONFIG.parent.mkdir(parents=True, exist_ok=True)
         self.client.CONFIG.write_text(json.dumps({"t3_url": f"http://127.0.0.1:{server.server_port}"}))
         os.environ["CODESPACE_T3_TOKEN"] = "test-token"
-        with patch.object(self.client, "require", return_value="code"), patch.object(self.client.subprocess, "run") as run:
-            run.return_value.returncode = 0
-            run.return_value.stdout = b'{"version":1}'
+        with patch.object(self.client.sys, "stdin", Mock(buffer=io.BytesIO(b'{"version":1}'))):
             with contextlib.redirect_stdout(io.StringIO()) as output:
-                self.assertEqual(self.client.t3(["import", "codex-work", "native-id", "--stopped"]), 0)
+                self.assertEqual(self.client.t3(["_receive"]), 0)
             self.assertEqual(json.loads(output.getvalue())["threadId"], "imported-thread")
             with self.assertRaisesRegex(SystemExit, "HTTP 302"):
-                self.client.t3(["import", "codex-work", "native-id", "--stopped"])
+                self.client.t3(["_receive"])
         self.assertEqual(len(received), 2)
         self.assertEqual(received[0], ("/api/codespace/import", "Bearer test-token", b'{"version":1}'))
 
     def test_transport_rejects_plaintext_remote_url_before_reading_token(self):
         with patch.object(self.client, "config", return_value={"t3_url": "http://remote-machine:3773"}):
             with self.assertRaisesRegex(SystemExit, "HTTPS or a loopback"):
-                self.client.t3(["import", "account", "session", "--stopped"])
+                self.client.t3(["_receive"])
+
+    def record(self):
+        self.write([{"type": "session_meta", "payload": {"id": "native-id"}}])
+        self.code.record_completed_session(self.account, {
+            "session_id": "native-id", "path": str(self.path), "cwd": self.tmp.name,
+            "home": self.tmp.name, "ended": 123,
+        })
+
+    def test_completed_receipt_rejects_changed_transcript(self):
+        self.record()
+        self.assertEqual(self.code.completed_session_thread(self.account, "native-id")["path"], str(self.path))
+        with self.path.open("a") as f:
+            f.write("{}\n")
+        with self.assertRaisesRegex(ValueError, "changed since Code"):
+            self.code.completed_session_thread(self.account, "native-id")
+
+    def test_account_lease_blocks_import_while_native_session_is_running(self):
+        with self.code.account_session_lock(self.account):
+            with self.assertRaisesRegex(ValueError, "running Code session"):
+                with self.code.account_session_lock(self.account, importing=True):
+                    self.fail("exclusive lease must not succeed")
+        with self.code.account_session_lock(self.account, importing=True):
+            with self.assertRaisesRegex(ValueError, "handoff in progress"):
+                with self.code.account_session_lock(self.account):
+                    self.fail("native session must not start during delivery")
+
+    def test_delivery_keeps_exclusive_lease_until_http_client_exits(self):
+        self.record()
+        def deliver(*args, **kwargs):
+            with self.assertRaises(ValueError):
+                with self.code.account_session_lock(self.account):
+                    self.fail("lease released too early")
+            self.assertEqual(json.loads(kwargs["input"])["sessionId"], "native-id")
+            return subprocess.CompletedProcess(args[0], 0)
+        with patch.object(self.code.subprocess, "run", side_effect=deliver):
+            self.code.cmd_thread_export({"accounts": [self.account]}, ["codex-work", "native-id", "--completed", "--model", "test-model", "--deliver-t3"])
+
+    def test_import_defaults_to_observed_completion(self):
+        with patch.object(self.client, "require", return_value="code"), patch.object(self.client.subprocess, "call", return_value=0) as call:
+            self.assertEqual(self.client.t3(["import", "codex-work", "native-id"]), 0)
+            self.assertEqual(call.call_args.args[0], ["code", "thread-export", "codex-work", "native-id", "--completed", "--deliver-t3"])
+
+    def test_real_supervised_child_produces_completed_receipt(self):
+        path = Path(self.tmp.name) / "sessions" / datetime.date.today().strftime("%Y/%m/%d") / "rollout-fixture.jsonl"
+        path.parent.mkdir(parents=True)
+        rows = [{"type": "session_meta", "payload": {"id": "observed-native", "cwd": self.tmp.name}}]
+        script = Path(self.tmp.name) / "provider.py"
+        script.write_text("#!" + sys.executable + "\nfrom pathlib import Path\nPath(" + repr(str(path)) + ").write_text(" + repr(json.dumps(rows[0]) + "\n") + ")\n")
+        script.chmod(0o700)
+        with patch.object(self.code, "binary_for", return_value=str(script)), patch.object(self.code, "auto_effort_ok", return_value=False), patch.object(self.code, "sync_claude_mcp"):
+            rc, _, session = self.code.supervise({"accounts": [self.account]}, self.account, [], cwd=self.tmp.name)
+        self.assertEqual(rc, 0)
+        self.assertEqual(session["session_id"], "observed-native")
+        self.assertEqual(self.code.completed_session_thread(self.account, "observed-native")["path"], str(path))
 
 
 if __name__ == "__main__":

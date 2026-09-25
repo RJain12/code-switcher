@@ -1429,7 +1429,75 @@ class NotInstalled(Exception):
         super().__init__(f"{label(acct)} isn't installed. Install it with:\n  {prov(acct)['install']}")
 
 
+def session_state_key(acct, session_id):
+    return hashlib.sha256(json.dumps([os.path.realpath(home_of(acct)), session_id]).encode()).hexdigest()
+
+
+def write_session_state(path, value):
+    import tempfile
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".state-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as output:
+            json.dump(value, output)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+@contextlib.contextmanager
+def account_session_lock(acct, importing=False):
+    directory = os.path.join(DATA, "session-locks")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    path = os.path.join(directory, session_state_key(acct, "account") + ".lock")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        # Shared leases allow parallel native conversations. Import takes an
+        # exclusive lease so no supervised CLI can write that account's history.
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_EX if importing else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("this account has a running Code session or a handoff in progress") from None
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def completed_session_path(acct, session_id):
+    return os.path.join(DATA, "completed-sessions", session_state_key(acct, session_id) + ".json")
+
+
+def transcript_fingerprint(path):
+    stat = os.stat(path)
+    return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns]
+
+
+def record_completed_session(acct, session):
+    if not session.get("session_id") or not session.get("path"):
+        return
+    record = dict(session, fingerprint=transcript_fingerprint(session["path"]), version=1)
+    write_session_state(completed_session_path(acct, session["session_id"]), record)
+
+
+def completed_session_thread(acct, session_id):
+    with open(completed_session_path(acct, session_id)) as source:
+        record = json.load(source)
+    if (record.get("version") != 1 or record.get("session_id") != session_id
+            or os.path.realpath(record.get("home", "")) != os.path.realpath(home_of(acct))
+            or record.get("fingerprint") != transcript_fingerprint(record["path"])):
+        raise ValueError("session changed since Code observed its exit; stop it again before handoff")
+    return {"id": session_id, "path": record["path"], "cwd": record["cwd"],
+            "title": record.get("title") or "Code session"}
+
+
 def supervise(db, acct, args, handoff=None, cwd=None, session_id=None):
+    with account_session_lock(acct) as lease_fd:
+        return supervise_locked(db, acct, args, handoff, cwd, session_id, lease_fd)
+
+
+def supervise_locked(db, acct, args, handoff=None, cwd=None, session_id=None, lease_fd=None):
     binary = binary_for(acct["provider"])
     if not binary:
         raise NotInstalled(acct)
@@ -1469,7 +1537,8 @@ def supervise(db, acct, args, handoff=None, cwd=None, session_id=None):
     for sig in (signal.SIGTERM, signal.SIGHUP):
         saved[sig] = signal.signal(sig, forward)
     try:
-        child = subprocess.Popen([binary] + args, env=launch_env, cwd=cwd)
+        child = subprocess.Popen([binary] + args, env=launch_env, cwd=cwd,
+                                 pass_fds=(lease_fd,) if lease_fd is not None else ())
         while child.poll() is None:
             try:
                 child.wait(timeout=2)
@@ -1499,6 +1568,11 @@ def supervise(db, acct, args, handoff=None, cwd=None, session_id=None):
         os.makedirs(DATA, mode=0o700, exist_ok=True)
         with open(LAST_SESSION, "w") as f:
             json.dump(session, f)
+    if child.poll() is not None and watcher.path:
+        try:
+            record_completed_session(acct, session)
+        except (OSError, ValueError) as error:
+            print(f"Code could not record T3 handoff readiness: {error}", file=sys.stderr)
     rc = child.returncode
     return (128 - rc if rc < 0 else rc), hit, session
 
@@ -2236,7 +2310,7 @@ usage:
   code best [provider] [args...] launch the account with the most usage left
   code add [provider] [name]     link an account (claude, codex, openrouter, grok, cursor, opencode)
   code list [--json]             print accounts and usage
-  code thread-export <account> <session-id> --stopped [--model MODEL]
+  code thread-export <account> <session-id> (--completed | --stopped) [--model MODEL]
   code threads [--json] [--limit N]
                                  list native provider sessions for T3/Codespace integration
   code login <id>                re-run login (or replace the API key) for an account
@@ -2383,19 +2457,34 @@ def cmd_thread_export(db, argv):
     parser.add_argument("account")
     parser.add_argument("session_id")
     parser.add_argument("--model")
-    parser.add_argument("--stopped", action="store_true", required=True,
+    parser.add_argument("--deliver-t3", action="store_true", help=argparse.SUPPRESS)
+    state = parser.add_mutually_exclusive_group(required=True)
+    state.add_argument("--completed", action="store_true",
+                       help="require Code to have observed this session exit and its transcript to be unchanged")
+    state.add_argument("--stopped", action="store_true",
                         help="assert that this native CLI session has stopped before transferring ownership to T3")
     args = parser.parse_args(argv)
     acct = find(db, args.account)
     if not acct:
         parser.error("unknown account; run code list")
-    thread = next((t for t in recent_threads(acct, 100) if t["id"] == args.session_id), None)
-    if not thread:
-        parser.error("session not found among this account's 100 recent threads")
     try:
-        print(json.dumps(session_import_payload(acct, thread, args.model), ensure_ascii=False))
-    except (OSError, ValueError) as error:
+        with account_session_lock(acct, importing=True):
+            thread = completed_session_thread(acct, args.session_id) if args.completed else next(
+                (t for t in recent_threads(acct, 100) if t["id"] == args.session_id), None)
+            if not thread:
+                parser.error("session not found among this account's 100 recent threads")
+            payload = json.dumps(session_import_payload(acct, thread, args.model), ensure_ascii=False)
+            if args.deliver_t3:
+                companion = os.path.join(os.path.dirname(os.path.realpath(__file__)), "codespace")
+                result = subprocess.run([sys.executable, companion, "t3", "_receive"],
+                                        input=payload.encode(), timeout=75)
+                if result.returncode:
+                    raise SystemExit(result.returncode)
+            else:
+                print(payload)
+    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
         parser.error(str(error))
+
 
 
 def cmd_threads(db, argv):

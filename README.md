@@ -48,17 +48,23 @@ and `t3_token_file` in the Codespace config. Issue the token with that T3 host's
 
 ```sh
 code threads --json
-codespace t3 import codex-work SESSION_ID --stopped
+codespace t3 import codex-work SESSION_ID
 # Run the import on the machine that owns the provider files and workspace:
-codespace on mini t3 import codex-default SESSION_ID --stopped
+codespace on mini t3 import codex-default SESSION_ID
 # Inspect the JSON payload without contacting T3:
-code thread-export codex-work SESSION_ID --stopped
+code thread-export codex-work SESSION_ID --completed
 ```
 
-Stop the native CLI before passing `--stopped`; this first version relies on that explicit ownership assertion.
+Code records completed supervised sessions and verifies the transcript is unchanged before handoff.
+`codespace t3 import` defaults to this proof of completion. An account lease prevents supervised Code
+sessions from starting while the export and HTTP import are in progress; import also waits for you to
+stop any other Code session using that account (it fails promptly rather than blocking the terminal).
+For older sessions or provider CLIs launched outside Code, stop that CLI and explicitly use `--stopped`.
+External CLI processes are not covered by Code's account leases. Continued editing in T3 and later CLI
+resumption still require manual ownership coordination; automatic two-way ownership is not enabled.
 T3 must have an enabled Claude or Codex provider instance pointing at the same account home.
 History import is retryable and preserves the native session ID for continuation. It currently exports text
-and image placeholders from the 100 most recent sessions per account; native tool history remains in
+and image placeholders from completed sessions recorded by Code (or the 100 most recent sessions per account with `--stopped`); native tool history remains in
 provider session files. Use `--model MODEL` when an older transcript has no model metadata.
 Automatic session discovery/ownership transfer and provider configuration remain in development.
 

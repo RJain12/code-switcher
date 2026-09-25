@@ -114,8 +114,13 @@ def t3(args):
     import urllib.error
     import urllib.parse
     import urllib.request
-    if not args or args[0] != "import":
-        raise SystemExit("usage: codespace t3 import <account> <session-id> --stopped [--model MODEL]")
+    if args and args[0] == "import":
+        export_args = args[1:]
+        if "--stopped" not in export_args and "--completed" not in export_args:
+            export_args = [*export_args, "--completed"]
+        return subprocess.call([require("code"), "thread-export", *export_args, "--deliver-t3"])
+    if args != ["_receive"]:
+        raise SystemExit("usage: codespace t3 import <account> <session-id> [--stopped] [--model MODEL]")
     settings = config()
     base = settings.get("t3_url", "http://127.0.0.1:3773")
     if not isinstance(base, str):
@@ -137,15 +142,14 @@ def t3(args):
             raise SystemExit("codespace: configure CODESPACE_T3_TOKEN or a private t3_token_file from `t3 auth session issue --token-only`") from None
     if not token or any(c.isspace() for c in token):
         raise SystemExit("codespace: invalid T3 session token")
-    result = subprocess.run([require("code"), "thread-export", *args[1:]], capture_output=True)
-    if result.returncode:
-        sys.stderr.buffer.write(result.stderr)
-        return result.returncode
+    payload = sys.stdin.buffer.read(32 * 1024 * 1024 + 1)
+    if len(payload) > 32 * 1024 * 1024:
+        raise SystemExit("codespace: T3 history exceeds the 32 MiB transport limit")
     # A redirect must never carry the bearer credential to another origin.
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             return None
-    request = urllib.request.Request(base.rstrip("/") + "/api/codespace/import", data=result.stdout,
+    request = urllib.request.Request(base.rstrip("/") + "/api/codespace/import", data=payload,
                                      headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.build_opener(NoRedirect).open(request, timeout=60) as response:
