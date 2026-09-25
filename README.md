@@ -24,6 +24,13 @@ If you hit rate limits on one subscription, you can keep working on another. `co
 
 ## Codespace (local first)
 
+Existing Claude/Codex profiles outside Code can be registered without moving credentials:
+`code adopt codex api --home ~/.codex-api` or `code adopt claude work --home ~/.claude-work`.
+Adoption keeps the existing configuration, detects already-registered homes, and marks the home
+as externally owned. Removing its Code entry never deletes that home. Adoption does not verify
+credential validity or quota; inspect usage or run a task separately. Supported adopted accounts
+are included in discovery and the configured automatic T3 mapping.
+
 Codespace is also available directly inside Code:
 
 ```sh
