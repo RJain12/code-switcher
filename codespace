@@ -573,6 +573,101 @@ def t3(args):
     return 0
 
 
+def execution_plan(workload, portable, needs, target, memory_mb):
+    local_needs = set(needs) & {"browser", "desktop", "keychain", "macos", "local-network"}
+    if target == "space" and (not portable or local_needs):
+        raise ValueError("Space requires a portable task with no Mac-only dependencies")
+    if target == "auto":
+        cloud = portable and not local_needs and (workload in {"compute", "build", "test", "media", "download"} or memory_mb >= 4096)
+        target = "space" if cloud else "local"
+    reason = ("Mac-only dependency: " + ", ".join(sorted(local_needs)) if local_needs else
+              "portable resource-intensive work" if target == "space" else "local execution requested or portability not established")
+    return {"target": target, "reason": reason, "workload": workload,
+            "needs": sorted(needs), "portable": portable, "memory_mb": memory_mb}
+
+
+def run_workload(args):
+    import argparse
+    import shlex
+    parser = argparse.ArgumentParser(prog="codespace run")
+    parser.add_argument("--target", choices=["auto", "local", "space"], default="auto")
+    parser.add_argument("--workload", choices=["general", "compute", "build", "test", "media", "download"], default="general")
+    parser.add_argument("--portable", action="store_true", help="declare that the command and its inputs can run on a Linux worker without this Mac's logins")
+    parser.add_argument("--needs", action="append", choices=["browser", "desktop", "keychain", "macos", "local-network"], default=[])
+    parser.add_argument("--memory-mb", type=int, default=0)
+    parser.add_argument("--file", "-f", action="append", default=[])
+    parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--wait", action="store_true", help="wait for a cloud result; otherwise return its job ID")
+    parser.add_argument("--plan", action="store_true", help="show the routing decision without running or uploading anything")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    opts = parser.parse_args(args)
+    command = opts.command[1:] if opts.command[:1] == ["--"] else opts.command
+    if not command:
+        parser.error("provide a command after --")
+    if opts.memory_mb < 0 or not 1 <= opts.timeout <= 86400:
+        parser.error("memory must be nonnegative and timeout must be between 1 and 86400 seconds")
+    try:
+        plan = execution_plan(opts.workload, opts.portable, opts.needs, opts.target, opts.memory_mb)
+    except ValueError as error:
+        parser.error(str(error))
+    files = [Path(name).expanduser().resolve() for name in opts.file]
+    if len({p.name for p in files}) != len(files):
+        parser.error("input files must have unique basenames")
+    for path in files:
+        if not path.is_file() or path.stat().st_size > 100 * 1024 * 1024:
+            parser.error("--file accepts regular files up to 100 MiB; use Space for larger inputs")
+    plan.update(command=command, inputs=[str(p) for p in files], timeout_seconds=opts.timeout)
+    if opts.plan:
+        print(json.dumps(plan, indent=2))
+        return 0
+    print("Codespace: " + plan["target"] + " — " + plan["reason"], file=sys.stderr)
+    if plan["target"] == "space":
+        invocation = [require("space"), "job", "run", "--timeout", str(opts.timeout)]
+        if not opts.wait:
+            invocation.append("--async")
+        else:
+            invocation += ["--wait", str(opts.timeout + 120)]
+        for path in files:
+            invocation += ["--file", str(path)]
+        invocation += ["--", shlex.join(command)]
+        environment = dict(os.environ)
+        if not environment.get("CLOUDSDK_PYTHON") and Path("/opt/homebrew/bin/python3").exists():
+            environment["CLOUDSDK_PYTHON"] = "/opt/homebrew/bin/python3"
+        return subprocess.call(invocation, env=environment)
+    cwd = None
+    if files:
+        import uuid
+        workspace = RELEASE_ROOT / "jobs" / str(uuid.uuid4())
+        (workspace / "input").mkdir(parents=True, mode=0o700)
+        (workspace / "out").mkdir()
+        for path in files:
+            shutil.copy2(path, workspace / "input" / path.name)
+        cwd = str(workspace)
+        print("Codespace local job files: " + cwd, file=sys.stderr)
+    import signal
+    child = subprocess.Popen(command, cwd=cwd, start_new_session=True)
+    def stop():
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+    try:
+        return child.wait(timeout=opts.timeout)
+    except subprocess.TimeoutExpired:
+        stop()
+        print("Codespace: local command exceeded its timeout", file=sys.stderr)
+        return 124
+    except KeyboardInterrupt:
+        stop()
+        raise
+
+
+
 def dispatch(argv):
     if not argv or argv[0] in ("code", "local"):
         args = argv[1:] if argv else []
@@ -584,6 +679,7 @@ def dispatch(argv):
 codespace on <host> [args]    start Code on a trusted Mac over SSH
 codespace space [args]        run the Space CLI on this Mac
 codespace job [args]          explicitly offload work to a Space worker
+codespace run [options] -- COMMAND  route portable work or keep Mac-dependent work local
 codespace menu [args]         install, update, or remove the Space menu app
 codespace find <query>        search this Mac, a peer Mac, and Space
 codespace t3 connect           enroll renewable local T3 access
@@ -625,6 +721,8 @@ Local work stays local unless you choose `on` or `job`.""")
         remote = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; ' + remote
         tty = ["-tt"] if sys.stdin.isatty() and sys.stdout.isatty() else ["-T"]
         return subprocess.call(["ssh", *tty, "-o", "ConnectTimeout=8", host, remote])
+    if command == "run":
+        return run_workload(args)
     if command == "maintenance":
         return maintenance()
     if command == "auto-update":

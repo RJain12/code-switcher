@@ -38,6 +38,32 @@ Set `sync_uri` in the same config file to a `gs://.../machines` path to read and
 directly when the mounted drive is slow.
 
 
+### Work placement
+
+```sh
+# Explain the decision; upload and execute nothing.
+codespace run --plan --portable --workload compute -- python3 analyze.py
+# Upload a small script and return a durable Space job ID.
+codespace run --portable --workload compute -f analyze.py -- python3 input/analyze.py
+# Browser/login-dependent work remains on the Mac hosting that environment.
+codespace on mini run --needs browser -- python3 browser_task.py
+codespace job status JOB_ID
+codespace job result JOB_ID
+codespace job cancel JOB_ID
+```
+
+Cloud execution requires an explicit `--portable` declaration. Compute, build, test, media, download,
+and declared memory needs of at least 4096 MiB select Space when no Mac dependencies are declared.
+`--needs browser|desktop|keychain|macos|local-network` keeps work local and rejects a forced cloud target.
+The router uses these declarations; it cannot infer every dependency from arbitrary code. Existing
+logins and desktop environments stay on their host. Use `--target local` or `--target space` to choose.
+
+Cloud jobs run asynchronously by default; `--wait` waits for the result. `-f` accepts explicit files up to
+100 MiB, available as `input/BASENAME`; write deliverables under `out/`. Large inputs should already be
+in Space and referenced as `/space/...` in cloud commands. Local execution with attached files creates
+a durable workspace under `~/.local/share/codespace/jobs/`; without attachments it uses your current
+directory. Commands are passed as argument lists; use `bash -lc '...'` explicitly for shell syntax.
+
 ### Managed CLI updates
 
 ```sh
