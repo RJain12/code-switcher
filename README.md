@@ -37,6 +37,32 @@ keys, OAuth tokens, emails, or local credential paths. Provider login remains on
 Set `sync_uri` in the same config file to a `gs://.../machines` path to read and write the catalog through GCS
 directly when the mounted drive is slow.
 
+
+### T3 session handoff (bridge preview)
+
+The Codespace T3 server extension is required; stock T3 does not yet expose the import endpoint.
+On the machine that owns the native session, configure `t3_url` (default `http://127.0.0.1:3773`)
+and `t3_token_file` in the Codespace config. Issue the token with that T3 host's
+`auth session issue --token-only` command and store it in a file owned by you with mode `600`.
+`CODESPACE_T3_TOKEN` can supply the token for one invocation. Tokens remain subject to T3 expiry and revocation.
+
+```sh
+code threads --json
+codespace t3 import codex-work SESSION_ID --stopped
+# Run the import on the machine that owns the provider files and workspace:
+codespace on mini t3 import codex-default SESSION_ID --stopped
+# Inspect the JSON payload without contacting T3:
+code thread-export codex-work SESSION_ID --stopped
+```
+
+Stop the native CLI before passing `--stopped`; this first version relies on that explicit ownership assertion.
+T3 must have an enabled Claude or Codex provider instance pointing at the same account home.
+History import is retryable and preserves the native session ID for continuation. It currently exports text
+and image placeholders from the 100 most recent sessions per account; native tool history remains in
+provider session files. Use `--model MODEL` when an older transcript has no model metadata.
+Automatic session discovery/ownership transfer and provider configuration remain in development.
+
+
 ## Features
 
 

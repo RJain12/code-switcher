@@ -108,6 +108,63 @@ def sync(args):
     return 0
 
 
+def t3(args):
+    """Call the T3 instance on the execution host; never relocate native logins."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    if not args or args[0] != "import":
+        raise SystemExit("usage: codespace t3 import <account> <session-id> --stopped [--model MODEL]")
+    settings = config()
+    base = settings.get("t3_url", "http://127.0.0.1:3773")
+    if not isinstance(base, str):
+        raise SystemExit("codespace: t3_url must be a URL")
+    url = urllib.parse.urlsplit(base)
+    if (url.scheme not in ("http", "https") or not url.hostname or url.username or url.password
+            or url.query or url.fragment or url.path not in ("", "/")
+            or (url.scheme == "http" and url.hostname not in ("127.0.0.1", "localhost", "::1"))):
+        raise SystemExit("codespace: T3 requires HTTPS or a loopback HTTP URL without credentials")
+    token = os.environ.get("CODESPACE_T3_TOKEN")
+    if not token:
+        token_path = Path(settings.get("t3_token_file", str(CONFIG.parent / "t3-token"))).expanduser()
+        try:
+            info = token_path.stat()
+            if info.st_mode & 0o077 or info.st_uid != os.getuid():
+                raise SystemExit("codespace: T3 token file must be owned by you and private (chmod 600)")
+            token = token_path.read_text().strip()
+        except OSError:
+            raise SystemExit("codespace: configure CODESPACE_T3_TOKEN or a private t3_token_file from `t3 auth session issue --token-only`") from None
+    if not token or any(c.isspace() for c in token):
+        raise SystemExit("codespace: invalid T3 session token")
+    result = subprocess.run([require("code"), "thread-export", *args[1:]], capture_output=True)
+    if result.returncode:
+        sys.stderr.buffer.write(result.stderr)
+        return result.returncode
+    # A redirect must never carry the bearer credential to another origin.
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+    request = urllib.request.Request(base.rstrip("/") + "/api/codespace/import", data=result.stdout,
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.build_opener(NoRedirect).open(request, timeout=60) as response:
+            imported = json.load(response)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            raise SystemExit("codespace: this T3 host does not have the Codespace import bridge installed") from None
+        if error.code in (401, 403):
+            raise SystemExit("codespace: T3 session is expired, revoked, or lacks orchestration permission; issue a new session token") from None
+        try:
+            detail = json.loads(error.read(8192)).get("error", "Import failed")
+        except (ValueError, AttributeError):
+            detail = "Import failed"
+        raise SystemExit(f"codespace: T3 HTTP {error.code}: {detail}") from None
+    except (urllib.error.URLError, TimeoutError, ValueError) as error:
+        raise SystemExit(f"codespace: T3 import could not finish ({type(error).__name__}); retrying the same session is safe") from None
+    print(json.dumps(imported, indent=2))
+    return 0
+
+
 def dispatch(argv):
     if not argv or argv[0] in ("code", "local"):
         args = argv[1:] if argv else []
@@ -121,6 +178,7 @@ codespace space [args]        run the Space CLI on this Mac
 codespace job [args]          explicitly offload work to a Space worker
 codespace menu [args]         install, update, or remove the Space menu app
 codespace find <query>        search this Mac, a peer Mac, and Space
+codespace t3 import ...       import a stopped native session into this host’s T3
 codespace sync [status]        publish or inspect nonsecret machine/provider profiles
 
 Aliases for `on` live in ~/.config/codespace/config.json:
@@ -146,11 +204,13 @@ Local work stays local unless you choose `on` or `job`.""")
         # SSH command arguments are parsed by the remote shell. Quote the fixed
         # executable and every Code argument, including user prompts.
         import shlex
-        remote = " ".join(shlex.quote(x) for x in ["$HOME/.local/bin/code", *code_args])
+        remote = " ".join(shlex.quote(x) for x in ["$HOME/.local/bin/codespace", *code_args])
         # Do not quote $HOME itself: it must expand on the remote Mac.
-        remote = remote.replace("'$HOME/.local/bin/code'", '"$HOME/.local/bin/code"', 1)
+        remote = remote.replace("'$HOME/.local/bin/codespace'", '"$HOME/.local/bin/codespace"', 1)
         tty = ["-tt"] if sys.stdin.isatty() and sys.stdout.isatty() else ["-T"]
         return subprocess.call(["ssh", *tty, "-o", "ConnectTimeout=8", host, remote])
+    if command == "t3":
+        return t3(args)
     if command == "sync":
         return sync(args)
     if command in ("space", "job", "menu"):

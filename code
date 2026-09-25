@@ -2236,6 +2236,7 @@ usage:
   code best [provider] [args...] launch the account with the most usage left
   code add [provider] [name]     link an account (claude, codex, openrouter, grok, cursor, opencode)
   code list [--json]             print accounts and usage
+  code thread-export <account> <session-id> --stopped [--model MODEL]
   code threads [--json] [--limit N]
                                  list native provider sessions for T3/Codespace integration
   code login <id>                re-run login (or replace the API key) for an account
@@ -2305,6 +2306,96 @@ def cmd_list(db, argv):
             if info.get("resets"):
                 parts.append(f"{info['resets']} banked resets")
             print(f"{head}\n    " + ("   ".join(parts) or info.get("note") or "no limit data"))
+
+
+def session_import_payload(acct, thread, model=None):
+    """Export display history; native provider files remain authoritative for resume."""
+    provider = acct["provider"]
+    if provider not in ("claude", "codex"):
+        raise ValueError("T3 import currently supports native Claude and Codex accounts")
+    source = os.path.realpath(thread["path"])
+    home = os.path.realpath(home_of(acct))
+    if os.path.commonpath([source, home]) != home:
+        raise ValueError("session transcript is outside this account's home")
+    before = os.stat(source)
+    messages, seen = [], set()
+    detected_model = None
+    for number, row in enumerate(jsonl(source)):
+        if not isinstance(row, dict):
+            continue
+        stamp = row.get("timestamp")
+        message = None
+        if provider == "codex":
+            payload = row.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if row.get("type") == "turn_context":
+                detected_model = payload.get("model") or detected_model
+            if row.get("type") == "session_meta" and payload.get("id") != thread["id"]:
+                raise ValueError("native session ID does not match the selected thread")
+            if row.get("type") == "response_item" and payload.get("type") == "message":
+                message = payload
+        elif not row.get("isSidechain") and not row.get("isMeta"):
+            if row.get("sessionId") and row["sessionId"] != thread["id"]:
+                raise ValueError("native session ID does not match the selected thread")
+            if row.get("type") in ("user", "assistant"):
+                message = row.get("message")
+                if isinstance(message, dict):
+                    detected_model = message.get("model") or detected_model
+        if not isinstance(message, dict) or message.get("role") not in ("user", "assistant", "system"):
+            continue
+        text = "\n".join(value for kind, value in content_parts(message.get("content")) if kind == "text")
+        if not text.strip():
+            continue
+        try:
+            date = dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+            if date.tzinfo is None:
+                raise ValueError("timestamp has no timezone")
+        except ValueError:
+            raise ValueError(f"session message {number} has no valid timestamp") from None
+        # Claude UUID identifies a transcript row; Codex response items often
+        # have no ID, so use their append-only row position.
+        identity = str(row.get("uuid") or message.get("id") or f"row-{number}")
+        if identity in seen:
+            continue
+        seen.add(identity)
+        messages.append({"id": identity, "role": message["role"], "text": text,
+                         "createdAt": date.astimezone(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")})
+        if len(messages) > 10000:
+            raise ValueError("session exceeds T3's 10,000-message import limit")
+    after = os.stat(source)
+    if (before.st_size, before.st_mtime_ns, before.st_ino) != (after.st_size, after.st_mtime_ns, after.st_ino):
+        raise ValueError("session changed during export; stop the CLI before importing")
+    selected_model = model or detected_model
+    if not selected_model or selected_model.startswith("<"):
+        raise ValueError("session has no usable model; specify --model")
+    cwd = thread.get("cwd")
+    if not cwd or not os.path.isabs(cwd) or not os.path.isdir(cwd):
+        raise ValueError("session workspace must exist on this host")
+    return {"version": 1, "provider": provider, "sessionId": thread["id"], "sourceHome": home,
+            "cwd": cwd, "title": thread.get("title") or "Code session", "model": selected_model,
+            "state": "stopped", "messages": messages}
+
+
+def cmd_thread_export(db, argv):
+    import argparse
+    parser = argparse.ArgumentParser(prog="code thread-export")
+    parser.add_argument("account")
+    parser.add_argument("session_id")
+    parser.add_argument("--model")
+    parser.add_argument("--stopped", action="store_true", required=True,
+                        help="assert that this native CLI session has stopped before transferring ownership to T3")
+    args = parser.parse_args(argv)
+    acct = find(db, args.account)
+    if not acct:
+        parser.error("unknown account; run code list")
+    thread = next((t for t in recent_threads(acct, 100) if t["id"] == args.session_id), None)
+    if not thread:
+        parser.error("session not found among this account's 100 recent threads")
+    try:
+        print(json.dumps(session_import_payload(acct, thread, args.model), ensure_ascii=False))
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
 
 
 def cmd_threads(db, argv):
@@ -2536,6 +2627,8 @@ def main():
         add_account(db, argv[1] if len(argv) > 1 else None, " ".join(argv[2:]) or None)
     elif cmd in ("list", "ls"):
         cmd_list(db, argv[1:])
+    elif cmd == "thread-export":
+        cmd_thread_export(db, argv[1:])
     elif cmd == "threads":
         cmd_threads(db, argv[1:])
     elif cmd in ("rm", "remove", "login"):
