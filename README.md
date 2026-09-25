@@ -24,6 +24,18 @@ If you hit rate limits on one subscription, you can keep working on another. `co
 
 ## Codespace (local first)
 
+Codespace is also available directly inside Code:
+
+```sh
+code space on mini t3 providers
+code space find "final report pdf"
+code dispatch --account codex-yt --model gpt-6-astra --prompt "Review this project"
+code space on mini t3 start --account codex-default --model gpt-6-astra --prompt "Review this project"
+```
+
+`code space` forwards all Codespace commands; `code dispatch` starts a T3 thread on this machine.
+Prompts may use `--prompt -` to read stdin. Remote workspaces must exist on the selected machine.
+
 `codespace` unifies Code and the Space CLI while keeping execution on the Mac where you start it. `codespace`
 starts the normal Code picker locally; `codespace on mini` launches Code on a configured Mac over SSH;
 `codespace job ask ...` explicitly sends work to a Space worker. `codespace menu` manages the Space menu app,
