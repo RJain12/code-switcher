@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""code — pick a Claude Code / Codex account (with live usage limits) and launch it."""
+import curses
+import datetime as dt
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+
+HOME = os.path.expanduser("~")
+DATA = os.path.join(HOME, ".code-accounts")
+DB = os.path.join(DATA, "accounts.json")
+CACHE = os.path.join(DATA, "usage-cache.json")
+CACHE_TTL = 90
+
+PROVIDERS = {
+    "claude": {"label": "Claude", "bin": "claude", "env": "CLAUDE_CONFIG_DIR", "default_home": os.path.join(HOME, ".claude"),
+               "shared": ["settings.json", "CLAUDE.md", "agents", "commands", "skills", "plugins", "keybindings.json", "statusline.sh"]},
+    "codex": {"label": "Codex", "bin": "codex", "env": "CODEX_HOME", "default_home": os.path.join(HOME, ".codex"),
+              "shared": ["config.toml", "AGENTS.md", "skills", "prompts", "rules"]},
+}
+
+
+# ---------- storage ----------
+
+def load_db():
+    try:
+        with open(DB) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        pass
+    accts = []
+    if os.path.exists(os.path.join(HOME, ".codex", "auth.json")):
+        accts.append({"id": "codex-default", "provider": "codex", "name": "default", "home": None})
+    if shutil.which("claude"):
+        accts.append({"id": "claude-default", "provider": "claude", "name": "default", "home": None})
+    db = {"accounts": accts, "last": None}
+    save_db(db)
+    return db
+
+
+def save_db(db):
+    os.makedirs(DATA, mode=0o700, exist_ok=True)
+    tmp = DB + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(db, f, indent=2)
+    os.replace(tmp, DB)
+
+
+def load_cache():
+    try:
+        with open(CACHE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cache(cache):
+    os.makedirs(DATA, mode=0o700, exist_ok=True)
+    with open(CACHE, "w") as f:
+        json.dump(cache, f)
+    os.chmod(CACHE, 0o600)
+
+
+def home_of(acct):
+    return acct["home"] or PROVIDERS[acct["provider"]]["default_home"]
+
+
+def env_for(acct):
+    env = dict(os.environ)
+    var = PROVIDERS[acct["provider"]]["env"]
+    env.pop(var, None)
+    if acct["home"]:
+        env[var] = acct["home"]
+    return env
+
+
+# ---------- credentials + usage ----------
+
+def http_json(url, headers):
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+
+def claude_creds(acct):
+    service = "Claude Code-credentials"
+    if acct["home"]:
+        service += "-" + hashlib.sha256(unicodedata.normalize("NFC", acct["home"]).encode()).hexdigest()[:8]
+    r = subprocess.run(["security", "find-generic-password", "-s", service, "-w"], capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        return json.loads(r.stdout).get("claudeAiOauth")
+    path = os.path.join(home_of(acct), ".credentials.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f).get("claudeAiOauth")
+    return None
+
+
+def iso_ts(s):
+    if not s:
+        return None
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def fetch_claude(acct):
+    c = claude_creds(acct)
+    if not c or not c.get("accessToken"):
+        return {"error": "not logged in"}
+    if c.get("expiresAt") and c["expiresAt"] / 1000 < time.time():
+        return {"error": "token expired, launch once to refresh", "plan": c.get("subscriptionType")}
+    u = http_json("https://api.anthropic.com/api/oauth/usage", {
+        "Authorization": "Bearer " + c["accessToken"],
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-code/code-switcher",
+    })
+    windows = []
+    for key, label in (("five_hour", "5h"), ("seven_day", "wk"), ("seven_day_opus", "opus")):
+        w = u.get(key)
+        if w and w.get("utilization") is not None:
+            windows.append({"label": label, "pct": float(w["utilization"]), "reset": iso_ts(w.get("resets_at"))})
+    out = {"plan": c.get("subscriptionType"), "windows": windows}
+    ex = u.get("extra_usage") or {}
+    if ex.get("is_enabled"):
+        out["extra"] = True
+    email = acct.get("email")
+    if not email:
+        r = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True, env=env_for(acct), timeout=20)
+        try:
+            email = json.loads(r.stdout).get("email")
+        except ValueError:
+            pass
+    out["email"] = email
+    return out
+
+
+def fetch_codex(acct):
+    path = os.path.join(home_of(acct), "auth.json")
+    if not os.path.exists(path):
+        return {"error": "not logged in"}
+    with open(path) as f:
+        auth = json.load(f)
+    t = auth.get("tokens") or {}
+    if not t.get("access_token"):
+        return {"error": "API-key auth (no plan limits)" if auth.get("OPENAI_API_KEY") else "not logged in"}
+    try:
+        u = http_json("https://chatgpt.com/backend-api/wham/usage", {
+            "Authorization": "Bearer " + t["access_token"],
+            "ChatGPT-Account-Id": t.get("account_id", ""),
+            "User-Agent": "codex-cli",
+        })
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return {"error": "token expired, launch once to refresh"}
+        raise
+    rl = u.get("rate_limit") or {}
+    windows = []
+    for key in ("primary_window", "secondary_window"):
+        w = rl.get(key)
+        if not w:
+            continue
+        secs = w.get("limit_window_seconds") or 0
+        label = "5h" if secs and secs <= 6 * 3600 else ("wk" if secs >= 6 * 86400 else f"{round(secs / 3600)}h")
+        windows.append({"label": label, "pct": float(w.get("used_percent") or 0), "reset": w.get("reset_at")})
+    windows.sort(key=lambda w: {"5h": 0}.get(w["label"], 1))
+    out = {"plan": u.get("plan_type"), "email": u.get("email"), "windows": windows}
+    cr = u.get("credits") or {}
+    if cr.get("has_credits") or cr.get("unlimited"):
+        out["extra"] = True
+    return out
+
+
+def fetch_usage(acct):
+    try:
+        info = fetch_claude(acct) if acct["provider"] == "claude" else fetch_codex(acct)
+    except urllib.error.HTTPError as e:
+        info = {"error": f"HTTP {e.code}"}
+    except Exception as e:  # network, parse, etc. — show it rather than crash the picker
+        info = {"error": type(e).__name__ + ": " + str(e)[:60]}
+    info["fetched"] = time.time()
+    return info
+
+
+# ---------- account management ----------
+
+def slug(s):
+    return "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in s.strip().lower()).strip("-") or "account"
+
+
+def link_shared(provider, home):
+    p = PROVIDERS[provider]
+    for name in p["shared"]:
+        src = os.path.join(p["default_home"], name)
+        dst = os.path.join(home, name)
+        if os.path.exists(src) and not os.path.lexists(dst):
+            os.symlink(src, dst)
+
+
+def add_account(db, provider=None, name=None):
+    if provider not in PROVIDERS:
+        print("Add account for:  1) Claude   2) Codex")
+        provider = {"1": "claude", "2": "codex"}.get(input("> ").strip())
+        if not provider:
+            print("Cancelled.")
+            return None
+    if not name:
+        name = input(f"Name for this {PROVIDERS[provider]['label']} account (e.g. work, personal): ").strip()
+    if not name:
+        print("Cancelled.")
+        return None
+    aid = f"{provider}-{slug(name)}"
+    if any(a["id"] == aid for a in db["accounts"]):
+        print(f"An account named '{name}' already exists for {provider}.")
+        return None
+    home = os.path.join(DATA, provider, slug(name))
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    link_shared(provider, home)
+    acct = {"id": aid, "provider": provider, "name": name, "home": home}
+    print(f"\nLogging in to {PROVIDERS[provider]['label']} as '{name}'. Use the account you want to link.\n")
+    cmd = ["claude", "auth", "login"] if provider == "claude" else ["codex", "login"]
+    rc = subprocess.run(cmd, env=env_for(acct)).returncode
+    if rc != 0:
+        print(f"\nLogin exited with code {rc}. Keeping the account; retry with: code login {aid}")
+    db["accounts"].append(acct)
+    save_db(db)
+    cache = load_cache()
+    cache.pop(aid, None)
+    save_cache(cache)
+    return acct
+
+
+def remove_account(db, acct):
+    db["accounts"] = [a for a in db["accounts"] if a["id"] != acct["id"]]
+    save_db(db)
+    if acct["home"] and acct["home"].startswith(DATA + os.sep):
+        if acct["provider"] == "claude":
+            subprocess.run(["claude", "auth", "logout"], env=env_for(acct), capture_output=True)
+        shutil.rmtree(acct["home"], ignore_errors=True)
+
+
+def launch(db, acct, args):
+    db["last"] = acct["id"]
+    save_db(db)
+    binary = PROVIDERS[acct["provider"]]["bin"]
+    path = shutil.which(binary)
+    if not path:
+        sys.exit(f"'{binary}' not found on PATH")
+    os.execve(path, [binary] + args, env_for(acct))
+
+
+# ---------- picker UI ----------
+
+def fmt_reset(ts):
+    if not ts:
+        return ""
+    delta = ts - time.time()
+    if delta <= 0:
+        return "now"
+    if delta < 3600:
+        return f"{int(delta // 60)}m"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h{int(delta % 3600 // 60):02d}m"
+    return dt.datetime.fromtimestamp(ts).strftime("%a %-I%p").replace("AM", "am").replace("PM", "pm")
+
+
+def headroom(info):
+    """Lower is better; used for the 'best pick' marker."""
+    if not info or info.get("error") or not info.get("windows"):
+        return 1e9
+    return max(w["pct"] for w in info["windows"])
+
+
+def picker(stdscr, db, usage, state):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    for i, c in enumerate((curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_CYAN, curses.COLOR_MAGENTA), 1):
+        curses.init_pair(i, c, -1)
+    GREEN, YELLOW, RED, CYAN, MAG = (curses.color_pair(i) for i in range(1, 6))
+    DIM, BOLD = curses.A_DIM, curses.A_BOLD
+    stdscr.timeout(250)
+
+    accts = db["accounts"]
+    ids = [a["id"] for a in accts]
+    sel = ids.index(db["last"]) if db.get("last") in ids else 0
+    message = ""
+
+    def color_for(p):
+        return GREEN if p < 60 else YELLOW if p < 85 else RED
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+
+        def put(y, x, text, attr=0):
+            if 0 <= y < h and x < w - 1:
+                try:
+                    stdscr.addstr(y, x, text[: max(0, w - 1 - x)], attr)
+                except curses.error:
+                    pass
+            return x + len(text)
+
+        put(0, 2, "code", BOLD | CYAN)
+        put(0, 7, "pick an account to launch", DIM)
+        keys = "enter launch  a add  d remove  l re-login  r refresh  q quit"
+        put(h - 1, 2, keys, DIM)
+        if message:
+            put(h - 2, 2, message, YELLOW)
+
+        if not accts:
+            put(2, 4, "No accounts yet. Press 'a' to add one.")
+        best = min(accts, key=lambda a: headroom(usage.get(a["id"])), default=None)
+        best_id = best["id"] if best and headroom(usage.get(best["id"])) < 100 else None
+
+        name_w = max([len(a["name"]) for a in accts] + [7])
+        y = 2
+        for i, a in enumerate(accts):
+            info = usage.get(a["id"])
+            is_sel = i == sel
+            x = put(y, 1, "›" if is_sel else " ", BOLD | CYAN)
+            prov = PROVIDERS[a["provider"]]["label"]
+            x = put(y, 3, f"{prov:<7}", (MAG if a["provider"] == "claude" else GREEN) | BOLD)
+            x = put(y, x + 1, f"{a['name']:<{name_w}}", BOLD if is_sel else 0)
+            email = (info or {}).get("email") or a.get("email") or ""
+            plan = (info or {}).get("plan") or ""
+            x = put(y, x + 2, email, DIM)
+            if plan:
+                x = put(y, x + 1, f"[{plan}]", DIM)
+            if a["id"] == best_id and len(accts) > 1:
+                put(y, x + 1, "★ most headroom", GREEN)
+            y += 1
+            if info is None or a["id"] in state["loading"] and not info:
+                put(y, 13, "loading usage…", DIM)
+            elif info.get("error"):
+                put(y, 13, info["error"], RED)
+            elif not info.get("windows"):
+                put(y, 13, "no limit data", DIM)
+            else:
+                x = 13
+                for win in info["windows"]:
+                    pct = win["pct"]
+                    filled = int(round(min(pct, 100) / 10))
+                    x = put(y, x, f"{win['label']:>4} ", DIM)
+                    x = put(y, x, "█" * filled, color_for(pct))
+                    x = put(y, x, "░" * (10 - filled), DIM)
+                    x = put(y, x, f" {pct:3.0f}%", color_for(pct) | BOLD)
+                    r = fmt_reset(win.get("reset"))
+                    x = put(y, x, f" resets {r}" if r else "", DIM)
+                    x += 3
+                if info.get("extra"):
+                    put(y, x, "+extra usage", CYAN)
+            y += 2
+        if state["loading"]:
+            put(0, w - 14, "refreshing…", DIM)
+        stdscr.refresh()
+
+        k = stdscr.getch()
+        if k == -1:
+            continue
+        message = ""
+        if k in (ord("q"), 27):
+            return ("quit", None)
+        if k in (curses.KEY_UP, ord("k")) and accts:
+            sel = (sel - 1) % len(accts)
+        elif k in (curses.KEY_DOWN, ord("j")) and accts:
+            sel = (sel + 1) % len(accts)
+        elif ord("1") <= k <= ord("9") and k - ord("1") < len(accts):
+            return ("launch", accts[k - ord("1")])
+        elif k in (10, 13, curses.KEY_ENTER) and accts:
+            return ("launch", accts[sel])
+        elif k == ord("a"):
+            return ("add", None)
+        elif k == ord("l") and accts:
+            return ("login", accts[sel])
+        elif k == ord("r"):
+            state["refresh"]()
+        elif k == ord("d") and accts:
+            a = accts[sel]
+            if not a["home"]:
+                message = "The default account can't be removed here (it is your normal ~/.claude or ~/.codex login)."
+                continue
+            put(h - 2, 2, f"Remove {PROVIDERS[a['provider']]['label']} '{a['name']}' and delete its login? (y/N) ", RED | BOLD)
+            stdscr.timeout(-1)
+            ans = stdscr.getch()
+            stdscr.timeout(250)
+            if ans in (ord("y"), ord("Y")):
+                remove_account(db, a)
+                accts = db["accounts"]
+                sel = min(sel, max(0, len(accts) - 1))
+                message = f"Removed '{a['name']}'."
+
+
+def run_picker(args):
+    db = load_db()
+    while True:
+        cache = load_cache()
+        usage = {a["id"]: cache[a["id"]] for a in db["accounts"] if a["id"] in cache}
+        state = {"loading": set()}
+        lock = threading.Lock()
+
+        def worker(a):
+            info = fetch_usage(a)
+            with lock:
+                usage[a["id"]] = info
+                state["loading"].discard(a["id"])
+                if info.get("email") and not a.get("email"):
+                    a["email"] = info["email"]
+
+        def refresh(force=True):
+            for a in db["accounts"]:
+                fresh = a["id"] in usage and time.time() - usage[a["id"]].get("fetched", 0) < CACHE_TTL
+                if a["id"] in state["loading"] or (fresh and not force):
+                    continue
+                state["loading"].add(a["id"])
+                threading.Thread(target=worker, args=(a,), daemon=True).start()
+
+        state["refresh"] = refresh
+        refresh(force=False)
+        action, acct = curses.wrapper(picker, db, usage, state)
+
+        with lock:
+            cache.update({k: v for k, v in usage.items() if "error" not in v or v["error"] != "not logged in"})
+            save_cache(cache)
+            save_db(db)
+
+        if action == "quit":
+            return
+        if action == "launch":
+            launch(db, acct, args)
+        if action == "add":
+            add_account(db)
+            input("\nPress enter to return to the picker…")
+        if action == "login":
+            relogin(db, acct)
+            input("\nPress enter to return to the picker…")
+
+
+def relogin(db, acct):
+    cmd = ["claude", "auth", "login"] if acct["provider"] == "claude" else ["codex", "login"]
+    subprocess.run(cmd, env=env_for(acct))
+    acct.pop("email", None)
+    save_db(db)
+    cache = load_cache()
+    cache.pop(acct["id"], None)
+    save_cache(cache)
+
+
+# ---------- CLI ----------
+
+HELP = """usage:
+  code [-- args...]           open the picker; extra args are passed to claude/codex
+  code add [claude|codex] [name]   link a new account
+  code list                   print accounts and usage
+  code login <id>             re-run login for an account
+  code rm <id>                remove an account
+  code <id> [args...]         launch an account directly (e.g. code claude-work)
+"""
+
+
+def find(db, key):
+    for a in db["accounts"]:
+        if key in (a["id"], a["name"]):
+            return a
+    return None
+
+
+def cmd_list(db):
+    results = {}
+    threads = [threading.Thread(target=lambda a=a: results.__setitem__(a["id"], fetch_usage(a))) for a in db["accounts"]]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for a in db["accounts"]:
+        info = results[a["id"]]
+        head = f"{a['id']:<24} {info.get('email') or a.get('email') or '':<32} {info.get('plan') or ''}"
+        if info.get("error"):
+            print(f"{head}\n    {info['error']}")
+        else:
+            parts = [f"{w['label']} {w['pct']:.0f}% (resets {fmt_reset(w.get('reset'))})" for w in info["windows"]]
+            print(f"{head}\n    " + ("   ".join(parts) or "no limit data"))
+    cache = load_cache()
+    cache.update(results)
+    save_cache(cache)
+
+
+def main():
+    argv = sys.argv[1:]
+    db = load_db()
+    if not argv or argv[0] == "--":
+        return run_picker(argv[1:])
+    cmd = argv[0]
+    if cmd in ("-h", "--help", "help"):
+        print(HELP)
+    elif cmd == "add":
+        add_account(db, argv[1] if len(argv) > 1 else None, " ".join(argv[2:]) or None)
+    elif cmd in ("list", "ls"):
+        cmd_list(db)
+    elif cmd in ("rm", "remove", "login"):
+        a = find(db, argv[1]) if len(argv) > 1 else None
+        if not a:
+            sys.exit(f"unknown account. Try: code list")
+        if cmd == "login":
+            relogin(db, a)
+        elif not a["home"]:
+            sys.exit("the default account can't be removed")
+        else:
+            remove_account(db, a)
+            print(f"removed {a['id']}")
+    elif find(db, cmd):
+        launch(db, find(db, cmd), argv[1:])
+    else:
+        print(HELP)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
