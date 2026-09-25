@@ -581,6 +581,32 @@ def t3_start(args, base, token):
     return 0
 
 
+def t3_wait(args, base, token):
+    import argparse
+    import urllib.parse
+    parser = argparse.ArgumentParser(prog="codespace t3 wait")
+    parser.add_argument("thread")
+    parser.add_argument("--timeout", type=float, default=300)
+    opts = parser.parse_args(args)
+    if not 0 < opts.timeout <= 86400:
+        parser.error("timeout must be greater than zero and at most 86400 seconds")
+    deadline = time.monotonic() + opts.timeout
+    path = "/api/orchestration/threads/" + urllib.parse.quote(opts.thread, safe="")
+    while True:
+        snapshot = t3_http(base, token, path)
+        thread = snapshot["thread"]
+        turn = thread.get("latestTurn") or {}
+        state = turn.get("state")
+        if state in ("completed", "error", "interrupted"):
+            print(json.dumps(snapshot, indent=2))
+            return 0 if state == "completed" else 1
+        if time.monotonic() >= deadline:
+            print(json.dumps(snapshot, indent=2))
+            print("Codespace wait timed out; the remote task was not stopped", file=sys.stderr)
+            return 124
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+
 def t3(args, quiet=False):
     """Call the T3 instance on the execution host; never relocate native logins."""
     import urllib.error
@@ -595,9 +621,10 @@ def t3(args, quiet=False):
             export_args = [*export_args, "--completed"]
         return subprocess.call([require("code"), "thread-export", *export_args, "--deliver-t3"])
     starting = args[:1] == ["start"]
+    waiting = args[:1] == ["wait"]
     inspecting = len(args) == 2 and args[0] in ("status", "stop")
     provider_sync = args in (["providers"], ["providers", "--apply"])
-    native = starting or inspecting or provider_sync or args == ["scan"] or (len(args) == 2 and args[0] == "import-project")
+    native = starting or waiting or inspecting or provider_sync or args == ["scan"] or (len(args) == 2 and args[0] == "import-project")
     if args != ["_receive"] and not native:
         raise SystemExit("usage: codespace t3 scan | providers [--apply] | import-project ID | import ACCOUNT SESSION [--stopped] [--model MODEL]")
     settings = config()
@@ -620,6 +647,8 @@ def t3(args, quiet=False):
         raise SystemExit("codespace: invalid T3 session token")
     if starting:
         return t3_start(args[1:], base, token)
+    if waiting:
+        return t3_wait(args[1:], base, token)
     if inspecting:
         import urllib.parse
         if args[0] == "status":
@@ -961,6 +990,7 @@ codespace menu [args]         install, update, or remove the Space menu app
 codespace find <query>        search this Mac, a peer Mac, and Space
 codespace t3 start --account ID --model MODEL --prompt TEXT [--cwd PATH]
 codespace t3 status|stop THREAD_ID  inspect or stop a dispatched thread
+codespace t3 wait THREAD_ID [--timeout SECONDS] wait for completion (nonzero on failure)
 codespace t3 connect           enroll renewable local T3 access
 codespace t3 renew             renew a managed token when due
 codespace t3 providers [--apply] map Code accounts into this host’s T3

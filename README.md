@@ -145,6 +145,12 @@ Codespace config controls the request deadline (default 180 seconds, maximum 180
 
 ### Dispatch an agent directly into T3
 
+After dispatch, `codespace t3 wait THREAD_ID --timeout 300` polls the saved thread and prints its
+snapshot. It exits 0 for a completed turn, 1 for an error or interruption, and 124 when the wait
+expires. A timeout leaves the task running; inspect it again or stop it explicitly. Individual HTTP
+requests can take up to 60 seconds beyond the polling deadline. Use `codespace on mini t3 wait ...`
+for a thread on the mini. Submission alone does not prove provider completion or task correctness.
+
 ```sh
 codespace t3 start --account codex-yt --model gpt-6-astra --cwd /path/to/repo --prompt 'Inspect the failing test'
 codespace on mini t3 start --account codex-default --model gpt-6-astra --cwd /path/on/mini --prompt 'Inspect the failing test'
