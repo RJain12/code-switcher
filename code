@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -2235,6 +2236,8 @@ usage:
   code best [provider] [args...] launch the account with the most usage left
   code add [provider] [name]     link an account (claude, codex, openrouter, grok, cursor, opencode)
   code list [--json]             print accounts and usage
+  code threads [--json] [--limit N]
+                                 list native provider sessions for T3/Codespace integration
   code login <id>                re-run login (or replace the API key) for an account
   code rm <id>                   remove an account
   code handoff                   move your last session (with its context) to another account
@@ -2302,6 +2305,33 @@ def cmd_list(db, argv):
             if info.get("resets"):
                 parts.append(f"{info['resets']} banked resets")
             print(f"{head}\n    " + ("   ".join(parts) or info.get("note") or "no limit data"))
+
+
+def cmd_threads(db, argv):
+    if any(arg not in ("--json", "--limit") and not arg.isdecimal() for arg in argv):
+        sys.exit("usage: code threads [--json] [--limit N]")
+    limit = 20
+    if "--limit" in argv:
+        i = argv.index("--limit")
+        if i + 1 >= len(argv) or not argv[i + 1].isdecimal():
+            sys.exit("code threads: --limit needs a number")
+        limit = int(argv[i + 1])
+        if not 1 <= limit <= 100:
+            sys.exit("code threads: --limit must be between 1 and 100")
+    machine = socket.gethostname()
+    rows = []
+    for acct in db["accounts"]:
+        for thread in recent_threads(acct, limit):
+            rows.append({"key": f"{machine}:{acct['id']}:{thread['id']}", "machine": machine,
+                         "account": acct["id"], "provider": acct["provider"],
+                         "engine": prov(acct)["engine"], **thread})
+    rows.sort(key=lambda row: row.get("updated") or 0, reverse=True)
+    if "--json" in argv:
+        print(json.dumps(rows, indent=2))
+    else:
+        for row in rows:
+            print(f"{row['account']:<24} {fmt_ago(row.get('updated')):<5} "
+                  f"{one_line(row['title'], 60)}  {short_path(row.get('cwd'))}")
 
 
 def cmd_best(db, argv):
@@ -2506,6 +2536,8 @@ def main():
         add_account(db, argv[1] if len(argv) > 1 else None, " ".join(argv[2:]) or None)
     elif cmd in ("list", "ls"):
         cmd_list(db, argv[1:])
+    elif cmd == "threads":
+        cmd_threads(db, argv[1:])
     elif cmd in ("rm", "remove", "login"):
         a = find(db, argv[1]) if len(argv) > 1 else None
         if not a:

@@ -102,6 +102,7 @@ Run `code`. You'll see every account with its usage. The selected account expand
 | `code` | Open the picker |
 | `code add [provider] [name]` | Link a new account: browser login or API key, depending on the provider |
 | `code list [--json]` | Print every account with its current usage |
+| `code threads [--json] [--limit N]` | List native session IDs, accounts, transcript paths, and working directories for integrations |
 | `code <id> [args…]` | Launch an account directly, e.g. `code claude-work` |
 | `code best [provider] [args…]` | Launch the account with the most usage left, e.g. `code best codex` |
 | `code login <id>` | Re-run login, or replace the API key |
