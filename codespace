@@ -607,12 +607,42 @@ def t3_wait(args, base, token):
         time.sleep(min(2, max(0, deadline - time.monotonic())))
 
 
+def shared_t3_history(settings):
+    instances = dict(settings.get("providerInstances", {}))
+    for driver in ("codex", "claudeAgent"):
+        instances.setdefault(driver, {"driver": driver, "config": settings.get("providers", {}).get(driver, {})})
+    seen, conflicts = {}, []
+    for name, instance in instances.items():
+        driver = instance.get("driver")
+        if driver not in ("codex", "claudeAgent") or instance.get("enabled") is False:
+            continue
+        cfg = instance.get("config") or {}
+        if cfg.get("enabled") is False:
+            continue
+        default = ".codex" if driver == "codex" else ".claude"
+        home = Path(cfg.get("homePath") or str(Path.home() / default)).expanduser()
+        history = home / ("sessions" if driver == "codex" else "projects")
+        if not history.exists():
+            continue
+        identity = (driver, os.path.realpath(history))
+        if identity in seen:
+            conflicts.append([seen[identity], name])
+        else:
+            seen[identity] = name
+    return conflicts
+
+
 def t3_import_cwd(path, base, token):
     import hashlib
     import datetime
     cwd = str(Path(path).expanduser().resolve())
     if not Path(cwd).is_dir():
         raise ValueError("workspace must exist on the execution host")
+    conflicts = shared_t3_history(t3_rpc_value(base, token, "server.getSettings", {}))
+    if conflicts:
+        raise ValueError("T3 provider instances share transcript directories: " +
+                         "; ".join(" / ".join(pair) for pair in conflicts) +
+                         ". Workspace import would duplicate account history; use direct T3 dispatch until history can be filtered by account.")
     snapshot = t3_http(base, token, "/api/orchestration/shell")
     project = next((p for p in snapshot["projects"] if os.path.realpath(p["workspaceRoot"]) == cwd), None)
     project_id = project["id"] if project else "codespace-" + hashlib.sha256(cwd.encode()).hexdigest()[:32]
@@ -722,6 +752,8 @@ def t3(args, quiet=False):
             except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
                 raise SystemExit("codespace: provider synchronization failed: " + str(error)) from None
         method = "agentSessions.scan" if args == ["scan"] else "agentSessions.import"
+        if method == "agentSessions.import" and shared_t3_history(t3_rpc_value(base, token, "server.getSettings", {})):
+            raise SystemExit("codespace: provider instances share transcript directories; workspace import would duplicate history")
         payload = {} if args == ["scan"] else {"projectId": args[1]}
         try:
             return subprocess.run([require("node"), "--input-type=module", "-e", T3_RPC_SCRIPT],

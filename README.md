@@ -166,6 +166,9 @@ Codespace config controls the request deadline (default 180 seconds, maximum 180
 `import-cwd` creates or reuses the T3 project for a local workspace and imports its native CLI
 history with a workspace identity guard. It does not start an agent turn. Use it after stopping
 CLI sessions for that workspace; this currently remains an explicit operation.
+Both workspace import commands reject provider instances whose history directories resolve to the
+same location. T3 0.0.42 otherwise imports that history under multiple account identities. Direct
+T3 dispatch remains available; automatic CLI-history handoff awaits account-specific import support.
 
 ### Dispatch an agent directly into T3
 
