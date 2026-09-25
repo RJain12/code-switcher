@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""code — pick a Claude Code / Codex account (with live usage limits) and launch it."""
+"""code: pick an AI coding agent account (with live usage limits) and launch it."""
 import curses
 import datetime as dt
+import getpass
 import glob
 import hashlib
+import http.client
+import http.server
 import json
 import os
 import re
@@ -25,13 +28,52 @@ CACHE = os.path.join(DATA, "usage-cache.json")
 CACHE_TTL = 90
 HANDOFFS = os.path.join(DATA, "handoffs")
 LAST_SESSION = os.path.join(DATA, "last-session.json")
+EFFORT_LOG = os.path.join(DATA, "effort.log")
+KEYCHAIN_SERVICE = "code-switcher"
 
+CLAUDE_SHARED = ["settings.json", "CLAUDE.md", "agents", "commands", "skills", "plugins", "keybindings.json", "statusline.sh"]
+
+# engine = which CLI/transcript format runs underneath (OpenRouter runs Claude Code against openrouter.ai).
 PROVIDERS = {
-    "claude": {"label": "Claude", "bin": "claude", "env": "CLAUDE_CONFIG_DIR", "default_home": os.path.join(HOME, ".claude"),
-               "shared": ["settings.json", "CLAUDE.md", "agents", "commands", "skills", "plugins", "keybindings.json", "statusline.sh"]},
-    "codex": {"label": "Codex", "bin": "codex", "env": "CODEX_HOME", "default_home": os.path.join(HOME, ".codex"),
-              "shared": ["config.toml", "AGENTS.md", "skills", "prompts", "rules"]},
+    "claude": {"label": "Claude", "engine": "claude", "bin": ["claude"], "env": "CLAUDE_CONFIG_DIR",
+               "default_home": os.path.join(HOME, ".claude"), "shared": CLAUDE_SHARED,
+               "login": ["auth", "login"], "logout": ["auth", "logout"],
+               "install": "curl -fsSL https://claude.ai/install.sh | bash"},
+    "codex": {"label": "Codex", "engine": "codex", "bin": ["codex"], "env": "CODEX_HOME",
+              "default_home": os.path.join(HOME, ".codex"), "shared": ["config.toml", "AGENTS.md", "skills", "prompts", "rules"],
+              "login": ["login"], "install": "npm i -g @openai/codex"},
+    "openrouter": {"label": "OpenRouter", "engine": "claude", "bin": ["claude"], "env": "CLAUDE_CONFIG_DIR",
+                   "default_home": None, "shared": CLAUDE_SHARED, "key": "OpenRouter API key (openrouter.ai/keys)",
+                   "install": "curl -fsSL https://claude.ai/install.sh | bash"},
+    "grok": {"label": "Grok", "engine": "grok", "bin": ["grok", "~/.grok/bin/grok"], "env": "GROK_HOME",
+             "default_home": os.path.join(HOME, ".grok"), "shared": [],
+             "login": ["login"], "logout": ["logout"], "install": "curl -fsSL https://x.ai/cli/install.sh | bash"},
+    "cursor": {"label": "Cursor", "engine": "cursor", "bin": ["cursor-agent", "agent"], "env": "CURSOR_CONFIG_DIR",
+               "default_home": os.path.join(HOME, ".cursor"), "shared": ["mcp.json", "rules"],
+               "login": ["login"], "key": "Cursor API key (cursor.com/dashboard → Integrations)",
+               "install": "curl https://cursor.com/install -fsS | bash"},
+    # OpenCode keeps logins in $XDG_DATA_HOME/opencode/auth.json; each account gets its own XDG_DATA_HOME.
+    "opencode": {"label": "OpenCode", "engine": "opencode", "bin": ["opencode"], "env": "XDG_DATA_HOME",
+                 "default_home": os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"),
+                 "shared": [], "keep_env_for_default": True, "login": ["auth", "login"], "install": "npm i -g opencode-ai"},
 }
+ORDER = ["claude", "codex", "openrouter", "grok", "cursor", "opencode"]
+
+
+def prov(acct):
+    return PROVIDERS[acct["provider"]]
+
+
+def label(acct):
+    return prov(acct)["label"]
+
+
+def binary_for(provider):
+    for b in PROVIDERS[provider]["bin"]:
+        path = shutil.which(os.path.expanduser(b))
+        if path:
+            return path
+    return None
 
 
 # ---------- storage ----------
@@ -39,17 +81,42 @@ PROVIDERS = {
 def load_db():
     try:
         with open(DB) as f:
-            return json.load(f)
+            db = json.load(f)
     except (OSError, ValueError):
-        pass
-    accts = []
-    if os.path.exists(os.path.join(HOME, ".codex", "auth.json")):
-        accts.append({"id": "codex-default", "provider": "codex", "name": "default", "home": None})
-    if shutil.which("claude"):
-        accts.append({"id": "claude-default", "provider": "claude", "name": "default", "home": None})
-    db = {"accounts": accts, "last": None}
-    save_db(db)
+        db = {"accounts": [], "last": None}
+    if detect_defaults(db):
+        save_db(db)
     return db
+
+
+def detect_defaults(db):
+    """Adopt logins that already exist on this machine, once each (removed ones stay removed)."""
+    seen = set(db.setdefault("seen_defaults", []))
+    if not seen:  # accounts created by older versions
+        seen.update(a["provider"] for a in db["accounts"] if not a.get("home"))
+    checks = {
+        "codex": lambda: os.path.exists(os.path.join(HOME, ".codex", "auth.json")),
+        "claude": lambda: bool(binary_for("claude")),
+        "grok": lambda: os.path.exists(os.path.join(HOME, ".grok", "auth.json")),
+        "cursor": lambda: bool(keychain_get("cursor-access-token", "cursor-user")),
+        "opencode": lambda: os.path.exists(os.path.join(PROVIDERS["opencode"]["default_home"], "opencode", "auth.json")),
+    }
+    changed = False
+    for p in ORDER:
+        if p in seen or p not in checks:
+            continue
+        try:
+            found = checks[p]()
+        except Exception:
+            found = False
+        if found:
+            db["accounts"].append({"id": f"{p}-default", "provider": p, "name": "default", "home": None})
+            seen.add(p)
+            changed = True
+    if sorted(seen) != sorted(db["seen_defaults"]):
+        db["seen_defaults"] = sorted(seen)
+        changed = True
+    return changed
 
 
 def save_db(db):
@@ -76,24 +143,78 @@ def save_cache(cache):
 
 
 def home_of(acct):
-    return acct["home"] or PROVIDERS[acct["provider"]]["default_home"]
+    return acct["home"] or prov(acct)["default_home"]
+
+
+# ---------- secrets (API keys live in the macOS keychain, or a 0600 file elsewhere) ----------
+
+def keychain_get(service, account):
+    if sys.platform != "darwin":
+        return None
+    r = subprocess.run(["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def key_path(acct):
+    return os.path.join(acct["home"], ".code-switcher-key")
+
+
+def key_get(acct):
+    if sys.platform == "darwin":
+        return keychain_get(KEYCHAIN_SERVICE, acct["id"])
+    try:
+        with open(key_path(acct)) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def key_set(acct, key):
+    if sys.platform == "darwin":
+        subprocess.run(["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", acct["id"], "-w", key],
+                       check=True, capture_output=True)
+    else:
+        fd = os.open(key_path(acct), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(key)
+
+
+def key_del(acct):
+    if sys.platform == "darwin":
+        subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", acct["id"]], capture_output=True)
 
 
 def env_for(acct):
+    p = prov(acct)
     env = dict(os.environ)
-    var = PROVIDERS[acct["provider"]]["env"]
-    env.pop(var, None)
     if acct["home"]:
-        env[var] = acct["home"]
+        env[p["env"]] = acct["home"]
+    elif not p.get("keep_env_for_default"):
+        env.pop(p["env"], None)
+    if acct["provider"] == "openrouter":
+        env.update(ANTHROPIC_BASE_URL="https://openrouter.ai/api", ANTHROPIC_AUTH_TOKEN=key_get(acct) or "",
+                   ANTHROPIC_API_KEY="")
+        if acct.get("model"):
+            env["ANTHROPIC_MODEL"] = acct["model"]
+    if acct["provider"] == "cursor" and acct.get("keyed"):
+        env["CURSOR_API_KEY"] = key_get(acct) or ""
     return env
 
 
-# ---------- credentials + usage ----------
+# ---------- usage ----------
 
-def http_json(url, headers):
-    req = urllib.request.Request(url, headers=headers)
+def http_json(url, headers, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, headers=headers, data=data)
     with urllib.request.urlopen(req, timeout=10) as r:
         return json.loads(r.read())
+
+
+def iso_ts(s):
+    if not s:
+        return None
+    return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
 
 
 def claude_creds(acct):
@@ -110,12 +231,6 @@ def claude_creds(acct):
     return None
 
 
-def iso_ts(s):
-    if not s:
-        return None
-    return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
-
-
 def fetch_claude(acct):
     c = claude_creds(acct)
     if not c or not c.get("accessToken"):
@@ -128,17 +243,17 @@ def fetch_claude(acct):
         "User-Agent": "claude-code/code-switcher",
     })
     windows = []
-    for key, label in (("five_hour", "5h"), ("seven_day", "wk"), ("seven_day_opus", "opus")):
+    for key, lbl in (("five_hour", "5h"), ("seven_day", "wk"), ("seven_day_opus", "opus")):
         w = u.get(key)
         if w and w.get("utilization") is not None:
-            windows.append({"label": label, "pct": float(w["utilization"]), "reset": iso_ts(w.get("resets_at"))})
+            windows.append({"label": lbl, "pct": float(w["utilization"]), "reset": iso_ts(w.get("resets_at"))})
     out = {"plan": c.get("subscriptionType"), "windows": windows}
-    ex = u.get("extra_usage") or {}
-    if ex.get("is_enabled"):
+    if (u.get("extra_usage") or {}).get("is_enabled"):
         out["extra"] = True
     email = acct.get("email")
     if not email:
-        r = subprocess.run(["claude", "auth", "status", "--json"], capture_output=True, text=True, env=env_for(acct), timeout=20)
+        r = subprocess.run([binary_for("claude") or "claude", "auth", "status", "--json"],
+                           capture_output=True, text=True, env=env_for(acct), timeout=20)
         try:
             email = json.loads(r.stdout).get("email")
         except ValueError:
@@ -147,12 +262,18 @@ def fetch_claude(acct):
     return out
 
 
+def codex_auth(acct):
+    try:
+        with open(os.path.join(home_of(acct), "auth.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
 def fetch_codex(acct):
-    path = os.path.join(home_of(acct), "auth.json")
-    if not os.path.exists(path):
+    auth = codex_auth(acct)
+    if not auth:
         return {"error": "not logged in"}
-    with open(path) as f:
-        auth = json.load(f)
     t = auth.get("tokens") or {}
     if not t.get("access_token"):
         return {"error": "API-key auth (no plan limits)" if auth.get("OPENAI_API_KEY") else "not logged in"}
@@ -173,8 +294,8 @@ def fetch_codex(acct):
         if not w:
             continue
         secs = w.get("limit_window_seconds") or 0
-        label = "5h" if secs and secs <= 6 * 3600 else ("wk" if secs >= 6 * 86400 else f"{round(secs / 3600)}h")
-        windows.append({"label": label, "pct": float(w.get("used_percent") or 0), "reset": w.get("reset_at")})
+        lbl = "5h" if secs and secs <= 6 * 3600 else ("wk" if secs >= 6 * 86400 else f"{round(secs / 3600)}h")
+        windows.append({"label": lbl, "pct": float(w.get("used_percent") or 0), "reset": w.get("reset_at")})
     windows.sort(key=lambda w: {"5h": 0}.get(w["label"], 1))
     out = {"plan": u.get("plan_type"), "email": u.get("email"), "windows": windows}
     cr = u.get("credits") or {}
@@ -183,12 +304,92 @@ def fetch_codex(acct):
     return out
 
 
+def fetch_openrouter(acct):
+    key = key_get(acct)
+    if not key:
+        return {"error": "no API key stored, press l to add one"}
+    hdr = {"Authorization": "Bearer " + key}
+    try:
+        d = http_json("https://openrouter.ai/api/v1/key", hdr).get("data") or {}
+    except urllib.error.HTTPError as e:
+        return {"error": "API key rejected" if e.code in (401, 403) else f"HTTP {e.code}"}
+    windows, plan = [], []
+    if d.get("limit"):
+        lim, rem = float(d["limit"]), d.get("limit_remaining")
+        used = lim - float(rem) if rem is not None else float(d.get("usage") or 0)
+        windows.append({"label": {"daily": "day", "weekly": "wk", "monthly": "mo"}.get(d.get("limit_reset"), "key"),
+                        "pct": 100 * used / lim, "reset": None})
+        plan.append(f"${lim - used:.2f} of ${lim:.0f} key limit left")
+    try:
+        c = http_json("https://openrouter.ai/api/v1/credits", hdr).get("data") or {}
+        total, used = float(c.get("total_credits") or 0), float(c.get("total_usage") or 0)
+        if total > 0:
+            windows.append({"label": "bal", "pct": 100 * used / total, "reset": None})
+            plan.append(f"${total - used:.2f} credits left")
+    except (urllib.error.URLError, ValueError):
+        pass
+    if d.get("is_free_tier"):
+        plan.append("free tier")
+    out = {"plan": ", ".join(plan) or f"${float(d.get('usage') or 0):.2f} used", "windows": windows}
+    if acct.get("model"):
+        out["email"] = acct["model"]
+    return out
+
+
+def fetch_grok(acct):
+    if not os.path.exists(os.path.join(home_of(acct), "auth.json")) and not acct.get("keyed"):
+        return {"error": "not logged in"}
+    return {"windows": [], "note": "Grok has no usage API; limit hits are still detected"}
+
+
+def _usage_pairs(obj, path="", out=None):
+    """Best-effort: find {used, limit} pairs in an unknown JSON response."""
+    out = [] if out is None else out
+    if isinstance(obj, dict):
+        lim = next((obj[k] for k in ("limit", "hardLimit", "includedLimit") if isinstance(obj.get(k), (int, float))), None)
+        used = next((obj[k] for k in ("used", "usage", "totalSpend", "includedSpend", "spend") if isinstance(obj.get(k), (int, float))), None)
+        if lim and used is not None:
+            out.append({"label": (path.split(".")[-1] or "plan")[:4], "pct": 100 * used / lim, "reset": None})
+        for k, v in obj.items():
+            _usage_pairs(v, f"{path}.{k}" if path else k, out)
+    return out
+
+
+def fetch_cursor(acct):
+    token = key_get(acct) if acct.get("keyed") else keychain_get("cursor-access-token", "cursor-user")
+    if not token:
+        return {"error": "not logged in"}
+    if acct.get("keyed"):
+        return {"windows": [], "note": "API-key account; Cursor only reports usage for browser logins"}
+    try:
+        u = http_json("https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+                      {"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                       "Connect-Protocol-Version": "1"}, body={})
+    except urllib.error.HTTPError as e:
+        return {"windows": [], "note": f"usage unavailable (HTTP {e.code})"}
+    windows = _usage_pairs(u)[:2]
+    return {"windows": windows, "note": None if windows else "usage format not recognized"}
+
+
+def fetch_opencode(acct):
+    try:
+        with open(os.path.join(home_of(acct), "opencode", "auth.json")) as f:
+            providers = sorted(json.load(f))
+    except (OSError, ValueError):
+        return {"error": "not logged in"}
+    return {"windows": [], "plan": ", ".join(providers), "note": "no usage API"}
+
+
+FETCHERS = {"claude": fetch_claude, "codex": fetch_codex, "openrouter": fetch_openrouter,
+            "grok": fetch_grok, "cursor": fetch_cursor, "opencode": fetch_opencode}
+
+
 def fetch_usage(acct):
     try:
-        info = fetch_claude(acct) if acct["provider"] == "claude" else fetch_codex(acct)
+        info = FETCHERS[acct["provider"]](acct)
     except urllib.error.HTTPError as e:
         info = {"error": f"HTTP {e.code}"}
-    except Exception as e:  # network, parse, etc. — show it rather than crash the picker
+    except Exception as e:  # network, parse, etc.: show it rather than crash the picker
         info = {"error": type(e).__name__ + ": " + str(e)[:60]}
     info["fetched"] = time.time()
     return info
@@ -202,58 +403,408 @@ def slug(s):
 
 def link_shared(provider, home):
     p = PROVIDERS[provider]
+    src_home = p["default_home"] or PROVIDERS["claude"]["default_home"]
     for name in p["shared"]:
-        src = os.path.join(p["default_home"], name)
+        src = os.path.join(src_home, name)
         dst = os.path.join(home, name)
         if os.path.exists(src) and not os.path.lexists(dst):
             os.symlink(src, dst)
 
 
+def ensure_installed(provider):
+    if binary_for(provider):
+        return True
+    p = PROVIDERS[provider]
+    print(f"\n{p['label']} needs `{p['bin'][0]}`, which isn't installed. Install command:\n  {p['install']}")
+    if input("Run it now? [y/N] ").strip().lower() == "y":
+        subprocess.run(p["install"], shell=True)
+    return bool(binary_for(provider))
+
+
+def ask_key(provider):
+    key = getpass.getpass(f"{PROVIDERS[provider]['key']}: ").strip()
+    if not key:
+        print("Cancelled.")
+    return key or None
+
+
 def add_account(db, provider=None, name=None):
     if provider not in PROVIDERS:
-        print("Add account for:  1) Claude   2) Codex")
-        provider = {"1": "claude", "2": "codex"}.get(input("> ").strip())
+        print("Add account for:  " + "   ".join(f"{i}) {PROVIDERS[p]['label']}" for i, p in enumerate(ORDER, 1)))
+        choice = input("> ").strip()
+        provider = ORDER[int(choice) - 1] if choice.isdigit() and 0 < int(choice) <= len(ORDER) else None
         if not provider:
             print("Cancelled.")
             return None
+    p = PROVIDERS[provider]
+    if not ensure_installed(provider):
+        print(f"`{p['bin'][0]}` still not found; add the account after installing it.")
+        return None
     if not name:
-        name = input(f"Name for this {PROVIDERS[provider]['label']} account (e.g. work, personal): ").strip()
+        name = input(f"Name for this {p['label']} account (e.g. work, personal): ").strip()
     if not name:
         print("Cancelled.")
         return None
     aid = f"{provider}-{slug(name)}"
     if any(a["id"] == aid for a in db["accounts"]):
-        print(f"An account named '{name}' already exists for {provider}.")
+        print(f"An account named '{name}' already exists for {p['label']}.")
         return None
-    home = os.path.join(DATA, provider, slug(name))
-    os.makedirs(home, mode=0o700, exist_ok=True)
-    link_shared(provider, home)
+
+    use_key = provider == "openrouter"
+    if provider == "cursor":
+        has_browser = any(a["provider"] == "cursor" and not a.get("keyed") for a in db["accounts"])
+        if has_browser:
+            print("Cursor keeps one browser login per machine (you already have one), so this account uses an API key.")
+            use_key = True
+        else:
+            use_key = input("Sign in with  1) browser (one per machine)  2) API key  > ").strip() == "2"
+
+    home = None
+    if use_key or provider != "cursor":
+        home = os.path.join(DATA, provider, slug(name))
+        os.makedirs(home, mode=0o700, exist_ok=True)
+        link_shared(provider, home)
     acct = {"id": aid, "provider": provider, "name": name, "home": home}
-    print(f"\nLogging in to {PROVIDERS[provider]['label']} as '{name}'. Use the account you want to link.\n")
-    cmd = ["claude", "auth", "login"] if provider == "claude" else ["codex", "login"]
-    rc = subprocess.run(cmd, env=env_for(acct)).returncode
-    if rc != 0:
-        print(f"\nLogin exited with code {rc}. Keeping the account; retry with: code login {aid}")
+
+    if use_key:
+        key = ask_key(provider)
+        if not key:
+            if home:
+                shutil.rmtree(home, ignore_errors=True)
+            return None
+        key_set(acct, key)
+        acct["keyed"] = True
+        if provider == "openrouter":
+            acct["model"] = input("Model (e.g. anthropic/claude-opus-5.5, openai/gpt-6, x-ai/grok-5; blank = Claude Code default): ").strip() or None
+    else:
+        print(f"\nLogging in to {p['label']} as '{name}'. Use the account you want to link.\n")
+        rc = subprocess.run([binary_for(provider)] + p["login"], env=env_for(acct)).returncode
+        if rc != 0:
+            print(f"\nLogin exited with code {rc}. Keeping the account; retry with: code login {aid}")
+    if provider == "codex":
+        acct["auto_effort"] = True
     db["accounts"].append(acct)
     save_db(db)
     cache = load_cache()
     cache.pop(aid, None)
     save_cache(cache)
+    info = fetch_usage(acct)
+    print(f"\nAdded {aid}: " + (info.get("error") or info.get("plan") or "ok"))
     return acct
 
 
 def remove_account(db, acct):
     db["accounts"] = [a for a in db["accounts"] if a["id"] != acct["id"]]
     save_db(db)
+    p = prov(acct)
+    if acct.get("keyed"):
+        key_del(acct)
     if acct["home"] and acct["home"].startswith(DATA + os.sep):
-        if acct["provider"] == "claude":
-            subprocess.run(["claude", "auth", "logout"], env=env_for(acct), capture_output=True)
+        if p.get("logout") and binary_for(acct["provider"]):
+            subprocess.run([binary_for(acct["provider"])] + p["logout"], env=env_for(acct), capture_output=True)
         shutil.rmtree(acct["home"], ignore_errors=True)
 
 
-# ---------- supervised sessions + handoff ----------
+def relogin(db, acct):
+    p = prov(acct)
+    if acct.get("keyed") or p.get("key") and acct["provider"] == "openrouter":
+        key = ask_key(acct["provider"])
+        if key:
+            key_set(acct, key)
+            acct["keyed"] = True
+    elif p.get("login") and ensure_installed(acct["provider"]):
+        subprocess.run([binary_for(acct["provider"])] + p["login"], env=env_for(acct))
+    acct.pop("email", None)
+    save_db(db)
+    cache = load_cache()
+    cache.pop(acct["id"], None)
+    save_cache(cache)
 
-CLAUDE_SESSION_FLAGS = {"-r", "--resume", "-c", "--continue", "--session-id", "--fork-session", "-p", "--print"}
+
+# ---------- dynamic reasoning effort (Codex / GPT-6) ----------
+#
+# Changing top-level `reasoning.effort` changes the cached prefix. GPT-6 accepts
+# {"type": "configuration_update", "reasoning": {"effort": ...}} items inside `input` instead,
+# which keep the prefix intact. Codex replays the full history on every request (store:false)
+# without knowing about items we inject, so every earlier update is re-inserted at the same
+# position each time; otherwise the prefix would change and the cache would miss.
+
+EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+LADDER = ["low", "medium", "high", "xhigh"]  # used when the model catalog does not say
+TOOL_ERR = re.compile(r"Exit code: [1-9]|\"exit_code\":\s*[1-9]|Traceback \(most recent|\bFAILED\b|\bpanicked\b"
+                      r"|(?i:\berror(\[E\d+\])?:)|command not found|No such file or directory")
+READ_ONLY = re.compile(r"^\s*(ls|cat|head|tail|rg|grep|find|fd|sed\s+-n|wc|pwd|tree|stat|file|nl|which"
+                       r"|git\s+(status|diff|log|show|branch|blame))\b")
+CALL_TYPES = ("function_call", "custom_tool_call", "local_shell_call")
+OUTPUT_TYPES = ("function_call_output", "custom_tool_call_output")
+
+
+def digest(item):
+    return hashlib.sha1(json.dumps(item, sort_keys=True).encode()).hexdigest()
+
+
+def call_text(item):
+    if item.get("type") == "local_shell_call":
+        a = (item.get("action") or {}).get("command")
+    else:
+        raw = item.get("arguments") or item.get("input") or ""
+        try:
+            j = json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError:
+            return str(raw)
+        a = (j.get("command") or j.get("cmd")) if isinstance(j, dict) else raw
+    if isinstance(a, list):
+        a = a[-1] if len(a) >= 3 and os.path.basename(str(a[0])) in ("bash", "zsh", "sh") else " ".join(map(str, a))
+    return str(a or "")
+
+
+def decide_effort(inp, s):
+    """Pick the effort for the next generation from what happened in the current turn."""
+    levels, base = s["levels"], s["base"]
+    bi = levels.index(base)
+    cur = s["ledger"][-1][1] if s["ledger"] else base
+    ci = levels.index(cur)
+    users = [i for i, it in enumerate(inp) if it.get("type") == "message" and it.get("role") == "user"]
+    last_user = users[-1] if users else -1
+    if last_user == len(inp) - 1:
+        return base, "new user message"
+    turn = inp[last_user + 1:]
+    calls = [it for it in turn if it.get("type") in CALL_TYPES]
+    outs = {it.get("call_id"): str(it.get("output")) for it in turn if it.get("type") in OUTPUT_TYPES}
+    recent = [outs.get(c.get("call_id"), "") for c in calls[-4:]]
+    errors = sum(1 for o in recent if TOOL_ERR.search(o))
+    last_failed = bool(recent) and bool(TOOL_ERR.search(recent[-1]))
+    # a loop = the same call returning the same output again (re-running a test after a fix is not a loop)
+    seen, looping = set(), False
+    for c in calls[-6:]:
+        sig = (c.get("name"), call_text(c), outs.get(c.get("call_id")))
+        looping |= sig in seen and sig[2] is not None
+        seen.add(sig)
+    if (last_failed and errors >= 2) or looping:
+        return levels[min(ci + 1, bi + 2, len(levels) - 1)], (
+            "stuck: same call, same result" if looping else f"stuck: {errors} of last 4 tool calls failed")
+    if s["since"] < 2:
+        return cur, "hold"
+    last3 = calls[-3:]
+    if len(last3) == 3 and errors == 0 and all(READ_ONLY.match(call_text(c)) for c in last3):
+        return levels[max(0, bi - 1)], "routine read-only steps"
+    if ci > bi and not last_failed:
+        return base, "recovered"
+    if ci < bi:
+        return base, "back to normal work"
+    return cur, "steady"
+
+
+def efforts_from_catalog(payload):
+    """Map model slug -> supported efforts from Codex's /models response (shape varies by version)."""
+    out = {}
+    models = (payload.get("models") or payload.get("data") or []) if isinstance(payload, dict) else payload
+    for m in models if isinstance(models, list) else []:
+        if not isinstance(m, dict):
+            continue
+        slug = m.get("slug") or m.get("id")
+        raw = m.get("supported_reasoning_levels") or m.get("supported_reasoning_efforts") or []
+        found = {x.get("effort") if isinstance(x, dict) else x for x in raw}
+        levels = [e for e in EFFORTS if e in found]
+        if slug and levels:
+            out[slug] = levels
+    return out
+
+
+def decompress(data, encoding):
+    encoding = (encoding or "").lower()
+    if encoding == "gzip":
+        import gzip
+        return gzip.decompress(data)
+    if encoding == "zstd":
+        from compression import zstd  # Python 3.14+
+        return zstd.decompress(data)
+    return data
+
+
+class EffortProxy:
+    UPSTREAM = "chatgpt.com"
+
+    def __init__(self, account_id):
+        self.account_id = account_id
+        self.sessions, self.model_levels = {}, {}
+        self.lock = threading.Lock()
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"  # close-delimited responses: simplest correct way to relay SSE
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                owner.handle(self)
+
+            do_POST = do_GET
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def codex_args(self):
+        base = f"http://127.0.0.1:{self.port}/backend-api/codex"
+        return ["-c", f'model_providers.code_switcher={{name="OpenAI",base_url="{base}",wire_api="responses",'
+                      f'requires_openai_auth=true,supports_websockets=false}}',
+                "-c", 'model_provider="code_switcher"']
+
+    def log(self, line):
+        try:
+            with open(EFFORT_LOG, "a") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {self.account_id} {line}\n")
+        except OSError:
+            pass
+
+    def rewrite(self, body):
+        """Returns (body_to_send, session_key or None if untouched)."""
+        try:
+            req = json.loads(body)
+        except ValueError:
+            return body, None
+        inp = req.get("input")
+        effort = (req.get("reasoning") or {}).get("effort") or "medium"
+        key = req.get("prompt_cache_key") or "default"
+        if not str(req.get("model", "")).startswith("gpt-6") or not isinstance(inp, list):
+            return body, None
+        with self.lock:
+            if key not in self.sessions:
+                levels = self.model_levels.get(req.get("model")) or LADDER
+                self.sessions[key] = {"base": effort, "levels": levels, "ledger": [], "since": 0, "head": None,
+                                      "disabled": effort not in levels, "lock": threading.Lock()}
+            s = self.sessions[key]
+        with s["lock"]:
+            if s["disabled"]:
+                return body, None
+            head = digest(inp[0]) if inp else None
+            valid = s["head"] in (None, head) and all(
+                a <= len(inp) and (a == 0 or digest(inp[a - 1]) == d) for a, _, d in s["ledger"])
+            if not valid:
+                self.log(f"{key[:8]} history rewritten (compaction?); starting a fresh effort ledger")
+                s["ledger"], s["since"] = [], 0
+            s["head"] = head
+            retry = s["ledger"] and s["ledger"][-1][0] == len(inp)
+            if not retry:
+                s["since"] += 1
+                level, why = decide_effort(inp, s)
+                cur = s["ledger"][-1][1] if s["ledger"] else s["base"]
+                if level != cur:
+                    s["ledger"].append((len(inp), level, digest(inp[-1]) if inp else None))
+                    s["since"] = 0
+                self.log(f"{key[:8]} items={len(inp)} effort={level}" + (f" (was {cur})" if level != cur else "") + f" [{why}]")
+            ledger = list(s["ledger"])
+        if not ledger:
+            return body, key
+        at = {}
+        for a, lvl, _ in ledger:
+            at[a] = {"type": "configuration_update", "reasoning": {"effort": lvl}}
+        out = []
+        for i, item in enumerate(inp):
+            if i in at:
+                out.append(at[i])
+            out.append(item)
+        if len(inp) in at:
+            out.append(at[len(inp)])
+        req["input"] = out
+        return json.dumps(req).encode(), key
+
+    def handle(self, h):
+        if h.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            body = b""
+            while True:
+                size = int(h.rfile.readline().strip() or b"0", 16)
+                if not size:
+                    h.rfile.readline()
+                    break
+                body += h.rfile.read(size)
+                h.rfile.readline()
+        else:
+            body = h.rfile.read(int(h.headers.get("Content-Length") or 0))
+        new, key, drop_encoding = body, None, False
+        if h.command == "POST" and h.path.split("?")[0].endswith("/responses"):
+            try:
+                enc = h.headers.get("Content-Encoding")
+                plain = decompress(body, enc) if enc else body
+                rewritten, key = self.rewrite(plain)
+                if key and rewritten is not plain:
+                    new, drop_encoding = rewritten, bool(enc)  # sent uncompressed; upstream accepts plain JSON
+            except ImportError:
+                self.log("request is zstd-compressed and this Python has no zstd (needs 3.14+); passing through")
+            except Exception as e:  # never break the session over effort tuning
+                self.log(f"rewrite failed, passing through: {e!r}")
+                new, key = body, None
+        resp, conn = self.upstream(h, new, drop_encoding)
+        if resp.status == 400 and new is not body and key:
+            err = resp.read()[:300]
+            conn.close()
+            with self.sessions[key]["lock"]:
+                self.sessions[key].update(disabled=True, ledger=[])
+            self.log(f"{key[:8]} backend rejected configuration_update ({err!r}); dynamic effort off for this session")
+            resp, conn = self.upstream(h, body)
+            drop_encoding = False
+        h.send_response(resp.status, resp.reason)
+        chunked = resp.getheader("Transfer-Encoding", "").lower() == "chunked"
+        for k, v in resp.getheaders():
+            if k.lower() in ("transfer-encoding", "connection", "keep-alive") or (chunked and k.lower() == "content-length"):
+                continue
+            h.send_header(k, v)
+        h.end_headers()
+        keep_all = h.command == "GET" and h.path.split("?")[0].endswith("/models") and resp.status == 200
+        tail, full = b"", []
+        try:
+            while True:
+                chunk = resp.read1(65536)
+                if not chunk:
+                    break
+                h.wfile.write(chunk)
+                h.wfile.flush()
+                tail = (tail + chunk)[-65536:]
+                if keep_all:
+                    full.append(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            conn.close()
+        if keep_all:
+            try:
+                catalog = efforts_from_catalog(json.loads(decompress(b"".join(full), resp.getheader("Content-Encoding"))))
+                with self.lock:
+                    self.model_levels.update(catalog)
+            except Exception:
+                pass
+        if key:
+            inp_t = re.findall(rb'"input_tokens":\s*(\d+)', tail)
+            cached = re.findall(rb'"cached_tokens":\s*(\d+)', tail)
+            if inp_t:
+                self.log(f"{key[:8]} tokens in={int(inp_t[-1])} cached={int(cached[-1]) if cached else 0}")
+
+    def upstream(self, h, body, drop_encoding=False):
+        conn = http.client.HTTPSConnection(self.UPSTREAM, timeout=900)
+        skip = {"host", "content-length", "connection", "transfer-encoding", "proxy-connection"}
+        if drop_encoding:
+            skip.add("content-encoding")
+        headers = {k: v for k, v in h.headers.items() if k.lower() not in skip}
+        headers["Host"] = self.UPSTREAM
+        if body:
+            headers["Content-Length"] = str(len(body))
+        conn.request(h.command, h.path, body=body or None, headers=headers)
+        return conn.getresponse(), conn
+
+
+def auto_effort_ok(acct, args):
+    if acct["provider"] != "codex" or not acct.get("auto_effort", True):
+        return False
+    if any("model_provider" in a for a in args):
+        return False
+    auth = codex_auth(acct) or {}
+    return bool((auth.get("tokens") or {}).get("access_token"))
+
+
+# ---------- supervised sessions + handoff ----------
 
 CONTINUE_NATIVE = ("The previous account hit its usage limit, so this session was moved to a different account. "
                    "Continue exactly where you left off.")
@@ -264,6 +815,13 @@ CONTINUE_TRANSCRIPT = (
     "Read the transcript first, then continue exactly where it left off: briefly say where things stand, "
     "then keep going on the last unfinished request. Don't redo work that is already done; check the files on disk if unsure."
 )
+
+# flags that mean the user is already choosing/resuming a session themselves
+SESSION_FLAGS = {
+    "claude": {"-r", "--resume", "-c", "--continue", "--session-id", "--fork-session", "-p", "--print"},
+    "grok": {"-r", "--resume", "-c", "--continue", "-s", "--session-id", "--fork-session"},
+}
+GROK_LIMIT = re.compile(rb"usage_limit_reached|usage_pool_exhausted")
 
 
 def claude_project_dir(home, cwd):
@@ -278,9 +836,9 @@ def first_json(path):
         return {}
 
 
-def limit_signal(provider, d):
+def limit_signal(engine, d):
     """Return a reason string if this transcript entry is a usage-limit error."""
-    if provider == "claude":
+    if engine == "claude":
         if d.get("isApiErrorMessage") and d.get("error") in ("rate_limit", "billing_error"):
             return d["error"]
         return None
@@ -294,9 +852,9 @@ def limit_signal(provider, d):
 
 
 def confirm_exhausted(acct, reason):
-    if reason in ("billing_error", "usage_limit_exceeded"):
+    if reason in ("billing_error", "usage_limit_exceeded", "usage_limit_reached", "usage_pool_exhausted"):
         return True
-    # A Claude "rate_limit" can be a transient 429; only switch if a plan window is actually full.
+    # "rate_limit" can be a transient 429; only switch if a plan window is actually full.
     info = fetch_usage(acct)
     return any(w["pct"] >= 99.5 for w in info.get("windows") or [])
 
@@ -304,23 +862,29 @@ def confirm_exhausted(acct, reason):
 class SessionWatcher:
     """Finds the transcript the child agent is writing and tails it for usage-limit errors."""
 
-    def __init__(self, acct, cwd, start, session_id=None):
+    def __init__(self, acct, cwd, start, session_id=None, resumed=False):
         self.acct, self.cwd, self.start, self.session_id = acct, cwd, start, session_id
+        self.engine = prov(acct)["engine"]
+        self.resumed = resumed
         self.path, self.pos = None, 0
 
     def _candidates(self):
         home = home_of(self.acct)
-        if self.acct["provider"] == "claude":
+        if self.engine == "claude":
             if self.session_id:
                 hits = glob.glob(os.path.join(home, "projects", "*", self.session_id + ".jsonl"))
                 if hits:
                     return hits
             return glob.glob(os.path.join(claude_project_dir(home, self.cwd), "*.jsonl"))
-        days = {dt.date.fromtimestamp(t) for t in (self.start - 86400, self.start, time.time())}
-        files = []
-        for d in days:
-            files += glob.glob(os.path.join(home, "sessions", f"{d:%Y/%m/%d}", "rollout-*.jsonl"))
-        return [f for f in files if (first_json(f).get("payload") or {}).get("cwd") == self.cwd]
+        if self.engine == "codex":
+            days = {dt.date.fromtimestamp(t) for t in (self.start - 86400, self.start, time.time())}
+            files = []
+            for d in days:
+                files += glob.glob(os.path.join(home, "sessions", f"{d:%Y/%m/%d}", "rollout-*.jsonl"))
+            return [f for f in files if (first_json(f).get("payload") or {}).get("cwd") == self.cwd]
+        if self.engine == "grok" and self.session_id:
+            return glob.glob(os.path.join(home, "sessions", "*", self.session_id, "updates.jsonl"))
+        return []  # cursor / opencode keep sessions in SQLite; no auto-detection
 
     def locate(self):
         if not self.path:
@@ -333,8 +897,10 @@ class SessionWatcher:
                     pass
             if cands:
                 self.path = max(cands, key=os.path.getmtime)
-                if self.acct["provider"] == "claude":
+                if self.engine == "claude":
                     self.session_id = os.path.basename(self.path)[:-len(".jsonl")]
+                if self.engine == "grok" and self.resumed:
+                    self.pos = os.path.getsize(self.path)  # old entries may contain the previous limit error
         return self.path
 
     def poll(self):
@@ -350,8 +916,12 @@ class SessionWatcher:
         if end < 0:
             return None
         self.pos += end + 1
+        chunk = data[:end]
+        if self.engine == "grok":
+            m = GROK_LIMIT.search(chunk)
+            return m.group().decode() if m else None
         found = None
-        for line in data[:end].splitlines():
+        for line in chunk.splitlines():
             try:
                 d = json.loads(line)
             except ValueError:
@@ -360,11 +930,11 @@ class SessionWatcher:
                 self.session_id = (d.get("payload") or {}).get("id") or self.session_id
             try:
                 ts = iso_ts(d.get("timestamp"))
-            except ValueError:
+            except (ValueError, AttributeError):
                 ts = None
             if ts and ts < self.start - 5:
                 continue  # history from a resumed session, not this run
-            found = limit_signal(self.acct["provider"], d) or found
+            found = limit_signal(self.engine, d) or found
         return found
 
 
@@ -385,22 +955,34 @@ def stop_child(child):
     reset_terminal()
 
 
+def fresh_session_args(acct, args):
+    """Pick the session id up front where the CLI allows it, so the watcher knows which log to tail."""
+    engine = prov(acct)["engine"]
+    if engine in SESSION_FLAGS and not any(a.split("=")[0] in SESSION_FLAGS[engine] for a in args):
+        sid = str(uuid.uuid4())
+        return [("--session-id" if engine == "claude" else "-s"), sid] + args, sid
+    return args, None
+
+
 def supervise(db, acct, args, handoff=None):
-    binary = shutil.which(PROVIDERS[acct["provider"]]["bin"])
+    binary = binary_for(acct["provider"])
     if not binary:
-        sys.exit(f"'{PROVIDERS[acct['provider']]['bin']}' not found on PATH")
+        sys.exit(f"{label(acct)} isn't installed. Install it with:\n  {prov(acct)['install']}")
     cwd = handoff["cwd"] if handoff and os.path.isdir(handoff.get("cwd") or "") else os.getcwd()
-    session_id = None
+    resumed = False
     if handoff:
-        args, session_id = prepare_handoff(acct, handoff)
-    elif acct["provider"] == "claude" and not any(a.split("=")[0] in CLAUDE_SESSION_FLAGS for a in args):
-        session_id = str(uuid.uuid4())
-        args = ["--session-id", session_id] + args
+        args, session_id, resumed = prepare_handoff(acct, handoff)
+    else:
+        args, session_id = fresh_session_args(acct, args)
+    proxy = None
+    if auto_effort_ok(acct, args):
+        proxy = EffortProxy(acct["id"])
+        args = proxy.codex_args() + args
     db["last"] = acct["id"]
     save_db(db)
 
     start = time.time()
-    watcher = SessionWatcher(acct, cwd, start, session_id)
+    watcher = SessionWatcher(acct, cwd, start, session_id, resumed)
     # The child owns the terminal; keep Ctrl+C / Ctrl+\ from killing the supervisor too.
     saved = {s: signal.signal(s, lambda *_: None) for s in (signal.SIGINT, signal.SIGQUIT)}
     hit = None
@@ -425,8 +1007,10 @@ def supervise(db, acct, args, handoff=None):
     finally:
         for s, h in saved.items():
             signal.signal(s, h)
+        if proxy:
+            proxy.server.shutdown()
 
-    session = {"provider": acct["provider"], "account": acct["id"], "path": watcher.path,
+    session = {"provider": acct["provider"], "account": acct["id"], "home": home_of(acct), "path": watcher.path,
                "session_id": watcher.session_id, "cwd": cwd, "ended": time.time()}
     if watcher.path:
         os.makedirs(DATA, mode=0o700, exist_ok=True)
@@ -441,18 +1025,28 @@ def run_session(db, acct, args, handoff=None):
         rc, hit, session = supervise(db, acct, args, handoff)
         if not hit:
             return rc
-        label = PROVIDERS[acct["provider"]]["label"]
         nxt = pick(db, {"exclude": acct["id"],
-                        "title": f"{label} '{acct['name']}' hit its usage limit. Continue this conversation on:"})
+                        "title": f"{label(acct)} '{acct['name']}' hit its usage limit. Continue this conversation on:"})
         if not nxt:
             print("Session saved. Continue it on another account later with: code handoff")
             return rc
         acct, args, handoff = nxt, [], session
 
 
+def prompt_args(target, prompt):
+    """Args that start `target` interactively with `prompt` as the first message; returns (args, session_id)."""
+    engine = prov(target)["engine"]
+    if engine == "opencode":
+        return ["--prompt", prompt], None
+    args, sid = fresh_session_args(target, [])
+    return args + [prompt], sid
+
+
 def prepare_handoff(target, h):
-    """Returns (args, claude_session_id) that start `target` with the handed-off conversation."""
-    if h["provider"] == "claude" and target["provider"] == "claude" and h.get("path") and h.get("session_id"):
+    """Returns (args, session_id, resumed) that start `target` with the handed-off conversation."""
+    src_engine = PROVIDERS[h["provider"]]["engine"]
+    dst_engine = prov(target)["engine"]
+    if src_engine == dst_engine == "claude" and h.get("path") and h.get("session_id"):
         src_dir = os.path.dirname(h["path"])
         dst_dir = os.path.join(home_of(target), "projects", os.path.basename(src_dir))
         os.makedirs(dst_dir, exist_ok=True)
@@ -461,15 +1055,20 @@ def prepare_handoff(target, h):
             side = os.path.join(src_dir, h["session_id"])  # subagent logs, saved tool outputs
             if os.path.isdir(side):
                 shutil.copytree(side, os.path.join(dst_dir, h["session_id"]), dirs_exist_ok=True)
-        return ["--resume", h["session_id"], CONTINUE_NATIVE], h["session_id"]
+        return ["--resume", h["session_id"], CONTINUE_NATIVE], h["session_id"], True
+    if src_engine == dst_engine == "grok" and h.get("path") and h.get("session_id"):
+        src_dir = os.path.dirname(h["path"])  # sessions/<cwd>/<id>/
+        rel = os.path.relpath(src_dir, h.get("home") or PROVIDERS[h["provider"]]["default_home"])
+        dst_dir = os.path.join(home_of(target), rel)
+        if os.path.realpath(dst_dir) != os.path.realpath(src_dir):
+            shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
+        return ["--resume", h["session_id"]], h["session_id"], True
 
     src = f"{PROVIDERS[h['provider']]['label']} (account '{h['account']}')"
     path = export_transcript(h, src)
     prompt = CONTINUE_TRANSCRIPT.format(src=src, path=path, raw=h.get("path") or "unavailable")
-    if target["provider"] == "claude":
-        sid = str(uuid.uuid4())
-        return ["--session-id", sid, prompt], sid
-    return [prompt], None
+    args, sid = prompt_args(target, prompt)
+    return args, sid, False
 
 
 # ---------- transcript export ----------
@@ -505,12 +1104,16 @@ def content_parts(content):
     return out
 
 
-def claude_entries(path):
-    for line in open(path):
+def jsonl(path):
+    for line in open(path, errors="replace"):
         try:
-            d = json.loads(line)
+            yield json.loads(line)
         except ValueError:
             continue
+
+
+def claude_entries(path):
+    for d in jsonl(path):
         if d.get("isSidechain") or d.get("isMeta"):
             continue
         if d.get("type") == "summary":
@@ -526,11 +1129,7 @@ def claude_entries(path):
 
 
 def codex_entries(path):
-    for line in open(path):
-        try:
-            d = json.loads(line)
-        except ValueError:
-            continue
+    for d in jsonl(path):
         p = d.get("payload")
         if not isinstance(p, dict):
             continue
@@ -545,19 +1144,38 @@ def codex_entries(path):
                 yield p["role"], s
         elif pt in ("function_call", "custom_tool_call"):
             yield "call", f"{p.get('name')} {p.get('arguments') or p.get('input') or ''}"
-        elif pt in ("function_call_output", "custom_tool_call_output"):
+        elif pt in OUTPUT_TYPES:
             out = p.get("output")
             yield "result", out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
         elif pt == "local_shell_call":
             yield "call", "shell " + json.dumps(p.get("action"), ensure_ascii=False)
 
 
+def grok_entries(path):
+    """Grok's chat_history.jsonl holds chat-completions style messages."""
+    hist = os.path.join(os.path.dirname(path), "chat_history.jsonl")
+    for d in jsonl(hist if os.path.exists(hist) else path):
+        m = d.get("message") if isinstance(d.get("message"), dict) else d
+        role = m.get("role")
+        if role in ("user", "assistant"):
+            for kind, s in content_parts(m.get("content")):
+                yield (role if kind == "text" else kind), s
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                yield "call", f"{fn.get('name')} {fn.get('arguments', '')}"
+        elif role == "tool":
+            yield "result", " ".join(s for _, s in content_parts(m.get("content")))
+
+
+ENTRIES = {"claude": claude_entries, "codex": codex_entries, "grok": grok_entries}
+
+
 def export_transcript(h, src):
     os.makedirs(HANDOFFS, mode=0o700, exist_ok=True)
     out = os.path.join(HANDOFFS, f"{time.strftime('%Y%m%d-%H%M%S')}-{h['account']}.md")
     entries = []
-    if h.get("path") and os.path.exists(h["path"]):
-        gen = claude_entries if h["provider"] == "claude" else codex_entries
+    gen = ENTRIES.get(PROVIDERS[h["provider"]]["engine"])
+    if gen and h.get("path") and os.path.exists(h["path"]):
         entries = list(gen(h["path"]))
     lines = [f"# Conversation handed off from {src}", "",
              f"- Working directory: `{h['cwd']}`", f"- Raw session log: `{h.get('path')}`", ""]
@@ -577,7 +1195,11 @@ def export_transcript(h, src):
             lines += ["**Tool result:**", "````", clip(s, 4000), "````", ""]
         else:
             lines += [f"> {clip(s, 1000)}", ""]
-    if not entries:
+    if not entries and h.get("path") and os.path.exists(h["path"]):
+        with open(h["path"], errors="replace") as f:
+            lines += ["The transcript format wasn't recognized, so here is the raw session log:", "", "````",
+                      clip(f.read(), 200_000), "````"]
+    elif not entries:
         lines.append("_(No transcript could be read; check the raw session log above.)_")
     with open(out, "w") as f:
         f.write("\n".join(lines))
@@ -610,10 +1232,12 @@ def headroom(info):
 def picker(stdscr, db, usage, state, handoff=None):
     curses.curs_set(0)
     curses.use_default_colors()
-    for i, c in enumerate((curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_CYAN, curses.COLOR_MAGENTA), 1):
+    for i, c in enumerate((curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_CYAN,
+                           curses.COLOR_MAGENTA, curses.COLOR_BLUE), 1):
         curses.init_pair(i, c, -1)
-    GREEN, YELLOW, RED, CYAN, MAG = (curses.color_pair(i) for i in range(1, 6))
+    GREEN, YELLOW, RED, CYAN, MAG, BLUE = (curses.color_pair(i) for i in range(1, 7))
     DIM, BOLD = curses.A_DIM, curses.A_BOLD
+    PCOLOR = {"claude": MAG, "codex": GREEN, "openrouter": CYAN, "grok": 0, "cursor": YELLOW, "opencode": BLUE}
     stdscr.timeout(250)
 
     def visible():
@@ -649,7 +1273,7 @@ def picker(stdscr, db, usage, state, handoff=None):
         else:
             put(0, 2, "code", BOLD | CYAN)
             put(0, 7, "pick an account to launch", DIM)
-            keys = "enter launch  a add  d remove  l re-login  r refresh  q quit"
+            keys = "enter launch  a add  d remove  l re-login  e auto-effort  r refresh  q quit"
         put(h - 1, 2, keys, DIM)
         if message:
             put(h - 2, 2, message, YELLOW)
@@ -662,30 +1286,32 @@ def picker(stdscr, db, usage, state, handoff=None):
             sel = [a["id"] for a in accts].index(best_id)
 
         name_w = max([len(a["name"]) for a in accts] + [7])
+        ind = 15
         y = top
         for i, a in enumerate(accts):
             info = usage.get(a["id"])
             is_sel = i == sel
-            x = put(y, 1, "›" if is_sel else " ", BOLD | CYAN)
-            prov = PROVIDERS[a["provider"]]["label"]
-            x = put(y, 3, f"{prov:<7}", (MAG if a["provider"] == "claude" else GREEN) | BOLD)
+            put(y, 1, "›" if is_sel else " ", BOLD | CYAN)
+            x = put(y, 3, f"{label(a):<10}", PCOLOR[a["provider"]] | BOLD)
             x = put(y, x + 1, f"{a['name']:<{name_w}}", BOLD if is_sel else 0)
             email = (info or {}).get("email") or a.get("email") or ""
             plan = (info or {}).get("plan") or ""
             x = put(y, x + 2, email, DIM)
             if plan:
                 x = put(y, x + 1, f"[{plan}]", DIM)
+            if a["provider"] == "codex" and a.get("auto_effort", True):
+                x = put(y, x + 1, "⚡auto-effort", CYAN)
             if a["id"] == best_id and len(accts) > 1:
                 put(y, x + 1, "★ most headroom", GREEN)
             y += 1
-            if info is None or a["id"] in state["loading"] and not info:
-                put(y, 13, "loading usage…", DIM)
+            if info is None:
+                put(y, ind, "loading usage…", DIM)
             elif info.get("error"):
-                put(y, 13, info["error"], RED)
+                put(y, ind, info["error"], RED)
             elif not info.get("windows"):
-                put(y, 13, "no limit data", DIM)
+                put(y, ind, info.get("note") or "no limit data", DIM)
             else:
-                x = 13
+                x = ind
                 for win in info["windows"]:
                     pct = win["pct"]
                     filled = int(round(min(pct, 100) / 10))
@@ -723,12 +1349,20 @@ def picker(stdscr, db, usage, state, handoff=None):
             return ("login", accts[sel])
         elif k == ord("r"):
             state["refresh"]()
+        elif k == ord("e") and accts:
+            a = accts[sel]
+            if a["provider"] != "codex":
+                message = "Auto-effort is Codex-only: other providers lose the prompt cache when effort changes."
+            else:
+                a["auto_effort"] = not a.get("auto_effort", True)
+                save_db(db)
+                message = f"Auto-effort {'on' if a['auto_effort'] else 'off'} for '{a['name']}'."
         elif k == ord("d") and accts and not handoff:
             a = accts[sel]
-            if not a["home"]:
-                message = "The default account can't be removed here (it is your normal ~/.claude or ~/.codex login)."
+            if not a["home"] and not a.get("keyed"):
+                message = "Default accounts are your normal logins and can't be removed here."
                 continue
-            put(h - 2, 2, f"Remove {PROVIDERS[a['provider']]['label']} '{a['name']}' and delete its login? (y/N) ", RED | BOLD)
+            put(h - 2, 2, f"Remove {label(a)} '{a['name']}' and delete its login? (y/N) ", RED | BOLD)
             stdscr.timeout(-1)
             ans = stdscr.getch()
             stdscr.timeout(250)
@@ -752,7 +1386,7 @@ def pick(db, handoff=None):
             with lock:
                 usage[a["id"]] = info
                 state["loading"].discard(a["id"])
-                if info.get("email") and not a.get("email"):
+                if info.get("email") and not a.get("email") and a["provider"] != "openrouter":
                     a["email"] = info["email"]
 
         def refresh(force=True):
@@ -768,7 +1402,7 @@ def pick(db, handoff=None):
         action, acct = curses.wrapper(picker, db, usage, state, handoff)
 
         with lock:
-            cache.update({k: v for k, v in usage.items() if "error" not in v or v["error"] != "not logged in"})
+            cache.update({k: v for k, v in usage.items() if v.get("error") != "not logged in"})
             save_cache(cache)
             save_db(db)
 
@@ -804,26 +1438,17 @@ def handoff_last(db):
         sys.exit(run_session(db, acct, [], handoff=h))
 
 
-def relogin(db, acct):
-    cmd = ["claude", "auth", "login"] if acct["provider"] == "claude" else ["codex", "login"]
-    subprocess.run(cmd, env=env_for(acct))
-    acct.pop("email", None)
-    save_db(db)
-    cache = load_cache()
-    cache.pop(acct["id"], None)
-    save_cache(cache)
-
-
 # ---------- CLI ----------
 
 HELP = """usage:
-  code [-- args...]           open the picker; extra args are passed to claude/codex
-  code add [claude|codex] [name]   link a new account
-  code list                   print accounts and usage
-  code login <id>             re-run login for an account
-  code rm <id>                remove an account
-  code <id> [args...]         launch an account directly (e.g. code claude-work)
-  code handoff                move your last session (with its context) to another account
+  code [-- args...]              open the picker; extra args are passed to the agent
+  code add [provider] [name]     link an account (claude, codex, openrouter, grok, cursor, opencode)
+  code list                      print accounts and usage
+  code login <id>                re-run login (or replace the API key) for an account
+  code rm <id>                   remove an account
+  code <id> [args...]            launch an account directly (e.g. code claude-work)
+  code handoff                   move your last session (with its context) to another account
+  code effort [<id> on|off]      show or toggle dynamic reasoning effort (Codex only)
 
 Agents launched through `code` are watched: if the account hits its usage limit, the agent is
 closed and you pick another account to continue the same conversation on.
@@ -832,9 +1457,10 @@ closed and you pick another account to continue the same conversation on.
 
 def find(db, key):
     for a in db["accounts"]:
-        if key in (a["id"], a["name"]):
+        if a["id"] == key:
             return a
-    return None
+    named = [a for a in db["accounts"] if a["name"] == key]
+    return named[0] if len(named) == 1 else None
 
 
 def cmd_list(db):
@@ -850,11 +1476,32 @@ def cmd_list(db):
         if info.get("error"):
             print(f"{head}\n    {info['error']}")
         else:
-            parts = [f"{w['label']} {w['pct']:.0f}% (resets {fmt_reset(w.get('reset'))})" for w in info["windows"]]
-            print(f"{head}\n    " + ("   ".join(parts) or "no limit data"))
+            parts = [f"{w['label']} {w['pct']:.0f}%" + (f" (resets {fmt_reset(w['reset'])})" if w.get("reset") else "")
+                     for w in info["windows"]]
+            print(f"{head}\n    " + ("   ".join(parts) or info.get("note") or "no limit data"))
     cache = load_cache()
     cache.update(results)
     save_cache(cache)
+
+
+def cmd_effort(db, argv):
+    if len(argv) >= 2:
+        a = find(db, argv[0])
+        if not a or a["provider"] != "codex":
+            sys.exit("auto-effort applies to Codex accounts only (see: code list)")
+        a["auto_effort"] = argv[1] == "on"
+        save_db(db)
+        print(f"auto-effort {'on' if a['auto_effort'] else 'off'} for {a['id']}")
+        return
+    for a in db["accounts"]:
+        if a["provider"] == "codex":
+            print(f"{a['id']:<24} auto-effort {'on' if a.get('auto_effort', True) else 'off'}")
+    try:
+        with open(EFFORT_LOG) as f:
+            lines = f.readlines()[-20:]
+        print("\nrecent decisions (" + EFFORT_LOG + "):\n" + "".join(lines))
+    except OSError:
+        print("\nno effort decisions logged yet")
 
 
 def main():
@@ -872,16 +1519,18 @@ def main():
     elif cmd in ("rm", "remove", "login"):
         a = find(db, argv[1]) if len(argv) > 1 else None
         if not a:
-            sys.exit(f"unknown account. Try: code list")
+            sys.exit("unknown account. Try: code list")
         if cmd == "login":
             relogin(db, a)
-        elif not a["home"]:
-            sys.exit("the default account can't be removed")
+        elif not a["home"] and not a.get("keyed"):
+            sys.exit("default accounts are your normal logins and can't be removed")
         else:
             remove_account(db, a)
             print(f"removed {a['id']}")
     elif cmd in ("handoff", "switch"):
         handoff_last(db)
+    elif cmd == "effort":
+        cmd_effort(db, argv[1:])
     elif find(db, cmd):
         sys.exit(run_session(db, find(db, cmd), argv[1:]))
     else:
