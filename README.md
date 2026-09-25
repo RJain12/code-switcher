@@ -44,10 +44,18 @@ T3 0.0.42 includes native session discovery and project history import. Configur
 T3 token as described below, then use these commands with the installed app:
 
 ```sh
+codespace t3 providers          # preview native account mappings
+codespace t3 providers --apply  # add missing provider instances on this host
 codespace t3 scan
 codespace t3 import-project PROJECT_ID
 codespace on mini t3 scan
 ```
+
+`providers` maps this machine's Code Claude/Codex accounts to T3 provider instances. It reuses matching
+homes and adds missing instances without editing existing ones, including their disabled state and
+environment settings. T3 reads the existing account credentials locally; this does not copy credentials
+between machines. Cursor and OpenRouter mappings are reported as unsupported until their credential
+adapters are implemented. Run the same command through `codespace on mini` for the mini's accounts.
 
 `scan` returns native projects and their existing T3 project IDs when available. `import-project`
 imports recent supported CLI history for an existing T3 project using T3's scanner and resume bindings.

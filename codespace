@@ -160,6 +160,50 @@ try {
 """
 
 
+def t3_provider_plan(accounts, settings, home=None):
+    """Map local native accounts without copying tokens or changing existing instances."""
+    import re
+    home = Path(home or Path.home())
+    instances = settings.get("providerInstances", {})
+    legacy = settings.get("providers", {})
+    candidates = dict(instances)
+    for driver in ("codex", "claudeAgent"):
+        if driver not in candidates:
+            candidates[driver] = {"driver": driver, "config": legacy.get(driver, {})}
+    additions, mappings, skipped = {}, [], []
+    def canonical(value):
+        return os.path.normpath(os.path.expanduser(value))
+    for account in accounts:
+        provider = account.get("provider")
+        if provider not in ("codex", "claude"):
+            skipped.append({"account": account.get("id"), "reason": "provider needs a separate credential adapter"})
+            continue
+        driver = "codex" if provider == "codex" else "claudeAgent"
+        source_home = canonical(account.get("home") or str(home / (".codex" if provider == "codex" else ".claude")))
+        if not os.path.isabs(source_home):
+            raise ValueError("Code account homes must be absolute paths")
+        match = None
+        for key, entry in {**candidates, **additions}.items():
+            if entry.get("driver") != driver:
+                continue
+            cfg = entry.get("config") or {}
+            if not isinstance(cfg, dict):
+                continue
+            # A shadow home may use different credentials from its shared history.
+            location = cfg.get("shadowHomePath") or cfg.get("homePath") or str(home / (".codex" if provider == "codex" else ".claude"))
+            if canonical(location) == source_home:
+                match = key
+                break
+        if match is None:
+            match = "codespace-" + re.sub(r"[^a-z0-9_-]+", "-", str(account["id"]).lower()).strip("-")
+            if match in candidates or match in additions:
+                raise ValueError("T3 instance name collision for " + account["id"])
+            additions[match] = {"driver": driver, "displayName": "Code · " + (account.get("name") or account["id"]),
+                                "enabled": True, "config": {"homePath": source_home, "enabled": True}}
+        mappings.append({"account": account["id"], "instance": match, "home": source_home, "new": match in additions})
+    return {"additions": additions, "mappings": mappings, "skipped": skipped}
+
+
 def t3(args):
     """Call the T3 instance on the execution host; never relocate native logins."""
     import urllib.error
@@ -170,9 +214,10 @@ def t3(args):
         if "--stopped" not in export_args and "--completed" not in export_args:
             export_args = [*export_args, "--completed"]
         return subprocess.call([require("code"), "thread-export", *export_args, "--deliver-t3"])
-    native = args == ["scan"] or (len(args) == 2 and args[0] == "import-project")
+    provider_sync = args in (["providers"], ["providers", "--apply"])
+    native = provider_sync or args == ["scan"] or (len(args) == 2 and args[0] == "import-project")
     if args != ["_receive"] and not native:
-        raise SystemExit("usage: codespace t3 import <account> <session-id> [--stopped] [--model MODEL]")
+        raise SystemExit("usage: codespace t3 scan | providers [--apply] | import-project ID | import ACCOUNT SESSION [--stopped] [--model MODEL]")
     settings = config()
     base = settings.get("t3_url", "http://127.0.0.1:3773")
     if not isinstance(base, str):
@@ -201,6 +246,33 @@ def t3(args):
             raise SystemExit("codespace: t3_timeout_seconds must be an integer from 5 to 1800") from None
         if not 5 <= timeout <= 1800:
             raise SystemExit("codespace: t3_timeout_seconds must be an integer from 5 to 1800")
+        if provider_sync:
+            def rpc(method, payload):
+                result = subprocess.run([require("node"), "--input-type=module", "-e", T3_RPC_SCRIPT],
+                    input=json.dumps({"base": base.rstrip("/"), "token": token, "method": method,
+                                      "payload": payload, "timeoutSeconds": timeout}).encode(),
+                    capture_output=True, timeout=timeout + 5)
+                if result.returncode:
+                    raise SystemExit("codespace: T3 provider settings request failed: " + result.stderr.decode(errors="replace").strip())
+                return json.loads(result.stdout)
+            account_file = Path(os.environ.get("CODE_ACCOUNTS_DIR", str(Path.home() / ".code-accounts"))) / "accounts.json"
+            try:
+                accounts = json.loads(account_file.read_text())["accounts"]
+                current = rpc("server.getSettings", {})
+                plan = t3_provider_plan(accounts, current)
+                if args[-1] == "--apply" and plan["additions"]:
+                    latest = rpc("server.getSettings", {})
+                    if latest != current:
+                        raise SystemExit("codespace: T3 settings changed during planning; retry")
+                    updated = rpc("server.updateSettings", {"patch": {"providerInstances": {
+                        **current.get("providerInstances", {}), **plan["additions"]}}})
+                    for key, value in plan["additions"].items():
+                        if updated.get("providerInstances", {}).get(key, {}).get("config", {}).get("homePath") != value["config"]["homePath"]:
+                            raise SystemExit("codespace: T3 did not confirm the expected provider home")
+                print(json.dumps({"applied": args[-1] == "--apply", **plan}, indent=2))
+                return 0
+            except (OSError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+                raise SystemExit("codespace: provider synchronization failed: " + str(error)) from None
         method = "agentSessions.scan" if args == ["scan"] else "agentSessions.import"
         payload = {} if args == ["scan"] else {"projectId": args[1]}
         try:
@@ -251,6 +323,7 @@ codespace space [args]        run the Space CLI on this Mac
 codespace job [args]          explicitly offload work to a Space worker
 codespace menu [args]         install, update, or remove the Space menu app
 codespace find <query>        search this Mac, a peer Mac, and Space
+codespace t3 providers [--apply] map Code accounts into this host’s T3
 codespace t3 scan             discover native sessions using installed T3
 codespace t3 import-project ID import native history into an existing T3 project
 codespace t3 import ...       import one stopped session (preview bridge required)

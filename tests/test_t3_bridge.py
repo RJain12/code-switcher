@@ -165,6 +165,32 @@ class T3Bridge(unittest.TestCase):
             self.assertEqual(request["method"], "agentSessions.import")
             self.assertEqual(request["payload"], {"projectId": "project-123"})
 
+    def test_provider_plan_preserves_existing_instances_and_is_idempotent(self):
+        accounts = [self.account, {"id": "claude-team", "provider": "claude", "home": "/accounts/team"}, {"id": "cursor-work", "provider": "cursor", "home": "/accounts/cursor"}]
+        existing = {"providerInstances": {"my-codex": {"driver": "codex", "enabled": False, "config": {"homePath": self.tmp.name}, "environment": [{"name": "SECRET", "sensitive": True, "valueRedacted": True, "value": ""}]}}}
+        original = json.dumps(existing, sort_keys=True)
+        plan = self.client.t3_provider_plan(accounts, existing, home=self.tmp.name)
+        self.assertEqual(plan["mappings"][0]["instance"], "my-codex")
+        self.assertEqual(set(plan["additions"]), {"codespace-claude-team"})
+        self.assertEqual(plan["additions"]["codespace-claude-team"]["driver"], "claudeAgent")
+        self.assertEqual(plan["skipped"][0]["account"], "cursor-work")
+        self.assertEqual(json.dumps(existing, sort_keys=True), original)
+        merged = {"providerInstances": {**existing["providerInstances"], **plan["additions"]}}
+        self.assertEqual(self.client.t3_provider_plan(accounts, merged, home=self.tmp.name)["additions"], {})
+
+    def test_provider_plan_rejects_collision_instead_of_overwriting_another_account(self):
+        existing = {"providerInstances": {"codespace-codex-work": {"driver": "codex", "config": {"homePath": "/different-account"}}}}
+        with self.assertRaisesRegex(ValueError, "collision"):
+            self.client.t3_provider_plan([self.account], existing)
+
+    def test_provider_plan_matches_default_homes_and_shadow_auth_homes(self):
+        home = self.tmp.name
+        accounts = [{"id": "codex-default", "provider": "codex", "home": None}, {"id": "claude-default", "provider": "claude", "home": None}, self.account]
+        settings = {"providerInstances": {"shadow": {"driver": "codex", "config": {"homePath": "/shared", "shadowHomePath": home}}}}
+        plan = self.client.t3_provider_plan(accounts, settings, home=home)
+        self.assertEqual([m["instance"] for m in plan["mappings"]], ["codex", "claudeAgent", "shadow"])
+        self.assertEqual(plan["additions"], {})
+
 
 if __name__ == "__main__":
     unittest.main()
