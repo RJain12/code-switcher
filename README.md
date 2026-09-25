@@ -53,7 +53,9 @@ codespace on mini t3 scan
 imports recent supported CLI history for an existing T3 project using T3's scanner and resume bindings.
 Stop native CLI sessions for that project first. This operation can import multiple sessions across
 configured provider instances. It requires Node 22+ for native WebSocket support; credentials travel
-through stdin and a single-use WebSocket ticket, not command-line arguments.
+through stdin and a single-use WebSocket ticket, not command-line arguments. Discovery can take
+several minutes when provider history is stored on a network drive. `t3_timeout_seconds` in the
+Codespace config controls the request deadline (default 180 seconds, maximum 1800).
 
 ### Single-session handoff (older bridge preview)
 

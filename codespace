@@ -114,7 +114,7 @@ const chunks = [];
 for await (const chunk of process.stdin) chunks.push(chunk);
 const input = JSON.parse(Buffer.concat(chunks).toString());
 let ws;
-const timer = setTimeout(() => fail("T3 RPC timed out"), 60000);
+const timer = setTimeout(() => fail("T3 RPC timed out while the host was processing the request"), input.timeoutSeconds * 1000);
 function fail(message) {
   clearTimeout(timer);
   if (ws) ws.close();
@@ -195,13 +195,19 @@ def t3(args):
     if not token or any(c.isspace() for c in token):
         raise SystemExit("codespace: invalid T3 session token")
     if native:
+        try:
+            timeout = int(settings.get("t3_timeout_seconds", 180))
+        except (ValueError, TypeError):
+            raise SystemExit("codespace: t3_timeout_seconds must be an integer from 5 to 1800") from None
+        if not 5 <= timeout <= 1800:
+            raise SystemExit("codespace: t3_timeout_seconds must be an integer from 5 to 1800")
         method = "agentSessions.scan" if args == ["scan"] else "agentSessions.import"
         payload = {} if args == ["scan"] else {"projectId": args[1]}
         try:
             return subprocess.run([require("node"), "--input-type=module", "-e", T3_RPC_SCRIPT],
                                   input=json.dumps({"base": base.rstrip("/"), "token": token,
-                                                    "method": method, "payload": payload}).encode(),
-                                  timeout=65).returncode
+                                                    "method": method, "payload": payload, "timeoutSeconds": timeout}).encode(),
+                                  timeout=timeout + 5).returncode
         except subprocess.TimeoutExpired:
             raise SystemExit("codespace: native T3 RPC timed out") from None
     payload = sys.stdin.buffer.read(32 * 1024 * 1024 + 1)
