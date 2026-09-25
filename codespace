@@ -15,6 +15,156 @@ CATALOG = Path.home() / "Space" / ".codespace" / "machines"
 CATALOG_CACHE = Path.home() / ".config" / "codespace" / "machines.json"
 
 
+RELEASE_ROOT = Path.home() / ".local" / "share" / "codespace"
+INSTALL_BIN = Path.home() / ".local" / "bin"
+
+
+def atomic_link(target, link):
+    temporary = link.with_name(link.name + ".new-" + str(os.getpid()))
+    try:
+        temporary.symlink_to(target)
+        temporary.replace(link)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def release_fetch(url, limit=2 * 1024 * 1024):
+    import urllib.request
+    request = urllib.request.Request(url, headers={"User-Agent": "Codespace-updater"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = response.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("release response exceeds size limit")
+    return data
+
+
+def validate_release(directory):
+    import hashlib
+    manifest = json.loads((directory / "release.json").read_text())
+    for name in ("code", "codespace"):
+        data = (directory / name).read_bytes()
+        if hashlib.sha256(data).hexdigest() != manifest["sha256"][name]:
+            raise ValueError("cached release failed integrity check: " + name)
+        compile(data, str(directory / name), "exec")
+    return manifest["commit"]
+
+
+def update(args):
+    """Install both entry points from one immutable GitHub commit."""
+    import fcntl
+    import hashlib
+    import re
+    if args not in ([], ["--install"], ["--rollback"], ["--status"]):
+        raise SystemExit("usage: codespace update [--install | --rollback | --status]")
+    current, previous = RELEASE_ROOT / "current", RELEASE_ROOT / "previous"
+    if args == ["--status"]:
+        print(json.dumps({"current": current.resolve().name if current.is_symlink() else None,
+                          "previous": previous.resolve().name if previous.is_symlink() else None}, indent=2))
+        return 0
+    if not current.is_symlink() and args != ["--install"]:
+        raise SystemExit("codespace: enable the managed installation with `codespace update --install`")
+    RELEASE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (RELEASE_ROOT / "update.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("codespace: an update is already running") from None
+        if args == ["--rollback"]:
+            if not previous.is_symlink():
+                raise SystemExit("codespace: no previous managed release")
+            target = previous.resolve()
+            validate_release(target)
+        else:
+            result = json.loads(release_fetch("https://api.github.com/repos/RJain12/code-switcher/commits/main"))
+            commit = result["sha"]
+            if not isinstance(commit, str) or not re.fullmatch(r"[a-f0-9]{40}", commit):
+                raise ValueError("GitHub returned an invalid commit")
+            target = RELEASE_ROOT / "releases" / commit
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                stage = Path(tempfile.mkdtemp(prefix=".stage-", dir=target.parent))
+                try:
+                    hashes = {}
+                    for name in ("code", "codespace"):
+                        data = release_fetch(f"https://raw.githubusercontent.com/RJain12/code-switcher/{commit}/{name}")
+                        compile(data, name, "exec")
+                        (stage / name).write_bytes(data)
+                        (stage / name).chmod(0o755)
+                        hashes[name] = hashlib.sha256(data).hexdigest()
+                    (stage / "release.json").write_text(json.dumps({"commit": commit, "sha256": hashes}))
+                    validate_release(stage)
+                    # These commands exercise both entry points without touching accounts.
+                    for name, flag in (("code", "--version"), ("codespace", "--help")):
+                        subprocess.run([sys.executable, str(stage / name), flag], check=True,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
+                    stage.rename(target)
+                finally:
+                    if stage.exists():
+                        shutil.rmtree(stage)
+            validate_release(target)
+        target = target.resolve()
+        unchanged = current.is_symlink() and current.resolve() == target
+        INSTALL_BIN.mkdir(parents=True, exist_ok=True)
+        # Preserve initial entry points, including links to a development checkout.
+        backups = RELEASE_ROOT / "original-entrypoints"
+        backups.mkdir(exist_ok=True)
+        for name in ("code", "Code", "codespace"):
+            entry = INSTALL_BIN / name
+            backup = backups / name
+            if (entry.exists() or entry.is_symlink()) and not (backup.exists() or backup.is_symlink()):
+                shutil.copy2(entry, backup, follow_symlinks=False)
+        old = current.resolve() if current.is_symlink() else None
+        if old and old != target:
+            atomic_link(old, previous)
+        atomic_link(target, current)
+        for name in ("code", "Code", "codespace"):
+            atomic_link(current / ("code" if name == "Code" else name), INSTALL_BIN / name)
+        print(("Codespace is current: " if unchanged else "Codespace installed: ") + target.name[:12])
+        return 0
+
+
+def auto_update(args):
+    import plistlib
+    if args not in (["enable"], ["disable"], ["status"]):
+        raise SystemExit("usage: codespace auto-update enable|disable|status")
+    if sys.platform != "darwin":
+        raise SystemExit("codespace: automatic updates currently use macOS launchd")
+    label = "com.codespace.cli-update"
+    domain = "gui/" + str(os.getuid())
+    service = domain + "/" + label
+    plist = Path.home() / "Library" / "LaunchAgents" / (label + ".plist")
+    loaded = subprocess.run(["launchctl", "print", service], capture_output=True).returncode == 0
+    if args == ["status"]:
+        print(json.dumps({"configured": plist.exists(), "loaded": loaded,
+                          "interval_seconds": 3600, "log": str(RELEASE_ROOT / "update.log")}, indent=2))
+        return 0
+    if loaded:
+        subprocess.run(["launchctl", "bootout", service], check=True, capture_output=True)
+    if args == ["disable"]:
+        plist.unlink(missing_ok=True)
+        print("Codespace automatic updates disabled")
+        return 0
+    current = RELEASE_ROOT / "current"
+    if not current.is_symlink():
+        raise SystemExit("codespace: run `codespace update --install` first")
+    validate_release(current)
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    document = {"Label": label, "ProgramArguments": [sys.executable, str(current / "codespace"), "update"],
+                "StartInterval": 3600, "RunAtLoad": True,
+                "ProcessType": "Background", "LowPriorityIO": True,
+                "StandardOutPath": str(RELEASE_ROOT / "update.log"),
+                "StandardErrorPath": str(RELEASE_ROOT / "update-error.log"),
+                "EnvironmentVariables": {"PATH": str(INSTALL_BIN) + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"}}
+    temporary = plist.with_suffix(".tmp")
+    temporary.write_bytes(plistlib.dumps(document))
+    temporary.chmod(0o600)
+    temporary.replace(plist)
+    subprocess.run(["launchctl", "enable", service], check=True, capture_output=True)
+    subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True, capture_output=True)
+    print("Codespace automatic updates enabled (hourly and at login)")
+    return 0
+
+
 def config():
     try:
         data = json.loads(CONFIG.read_text())
@@ -328,6 +478,8 @@ codespace t3 scan             discover native sessions using installed T3
 codespace t3 import-project ID import native history into an existing T3 project
 codespace t3 import ...       import one stopped session (preview bridge required)
 codespace sync [status]        publish or inspect nonsecret machine/provider profiles
+codespace update [--install | --rollback | --status] manage paired CLI releases
+codespace auto-update enable|disable|status          hourly macOS updates
 
 Aliases for `on` live in ~/.config/codespace/config.json:
   {"hosts":{"mini":"clawdbot@Clawdbots-Mac-mini.local"}}
@@ -358,6 +510,10 @@ Local work stays local unless you choose `on` or `job`.""")
         remote = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; ' + remote
         tty = ["-tt"] if sys.stdin.isatty() and sys.stdout.isatty() else ["-T"]
         return subprocess.call(["ssh", *tty, "-o", "ConnectTimeout=8", host, remote])
+    if command == "auto-update":
+        return auto_update(args)
+    if command == "update" and "--providers" not in args:
+        return update([] if args == ["--self"] else args)
     if command == "t3":
         return t3(args)
     if command == "sync":

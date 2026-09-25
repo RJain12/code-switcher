@@ -38,6 +38,24 @@ Set `sync_uri` in the same config file to a `gs://.../machines` path to read and
 directly when the mounted drive is slow.
 
 
+### Managed CLI updates
+
+```sh
+codespace update --install
+codespace auto-update enable
+codespace update --status
+codespace update --rollback
+codespace auto-update disable
+```
+
+Managed installs download `code` and `codespace` from the same pinned GitHub commit, validate both,
+and switch one release pointer. Existing development files stay intact; initial entrypoints are backed
+up under `~/.local/share/codespace/original-entrypoints`. A failed download leaves the current release
+active. Prior releases remain available for rollback. Disable automatic updates before rolling back
+if you want to stay on that release. The launchd task checks hourly and at login while your Mac is
+awake; logs live under `~/.local/share/codespace/`. Run setup separately on each Mac. This updates
+the CLI pair; T3, the menu app, provider binaries, and cloud workers retain their own update paths.
+
 ### Installed T3 integration
 
 T3 0.0.42 includes native session discovery and project history import. Configure the local
