@@ -467,6 +467,107 @@ def maintenance():
     return 0 if all(result["ok"] for result in results.values()) else 1
 
 
+def t3_http(base, token, path, payload=None):
+    import urllib.request
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    request = urllib.request.Request(base.rstrip("/") + path,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    with urllib.request.build_opener(NoRedirect).open(request, timeout=60) as response:
+        data = response.read(32 * 1024 * 1024 + 1)
+    if len(data) > 32 * 1024 * 1024:
+        raise ValueError("T3 response exceeds the 32 MiB limit")
+    return json.loads(data)
+
+
+def t3_rpc_value(base, token, method, payload):
+    result = subprocess.run([require("node"), "--input-type=module", "-e", T3_RPC_SCRIPT],
+        input=json.dumps({"base": base.rstrip("/"), "token": token, "method": method,
+                          "payload": payload, "timeoutSeconds": 60}).encode(),
+        capture_output=True, timeout=65)
+    if result.returncode:
+        raise ValueError("T3 RPC failed: " + result.stderr.decode(errors="replace").strip())
+    return json.loads(result.stdout)
+
+
+def t3_start(args, base, token):
+    import argparse
+    import datetime
+    import fcntl
+    import hashlib
+    import uuid
+    parser = argparse.ArgumentParser(prog="codespace t3 start")
+    parser.add_argument("--account", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--cwd", default=os.getcwd())
+    parser.add_argument("--title", default="Code task")
+    parser.add_argument("--request-id", default=None, help="reuse this ID to safely retry an interrupted dispatch")
+    parser.add_argument("--prompt", required=True, help="task text, or - to read stdin")
+    opts = parser.parse_args(args)
+    prompt = sys.stdin.read() if opts.prompt == "-" else opts.prompt
+    if not prompt.strip() or not opts.title.strip() or not opts.model.strip():
+        parser.error("prompt, title, and model must not be empty")
+    cwd = str(Path(opts.cwd).expanduser().resolve())
+    if not Path(cwd).is_dir():
+        parser.error("workspace must exist on the execution host")
+    request_id = opts.request_id or str(uuid.uuid4())
+    identity = hashlib.sha256((base + "\0" + request_id).encode()).hexdigest()[:32]
+    directory = CONFIG.parent / "dispatches"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    record_path = directory / (identity + ".json")
+    inputs = {"account": opts.account, "model": opts.model, "cwd": cwd, "title": opts.title, "prompt": prompt}
+    with (directory / (identity + ".lock")).open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if record_path.exists():
+            record = json.loads(record_path.read_text())
+            if record["inputs"] != inputs:
+                parser.error("this request ID already belongs to a different task")
+        else:
+            accounts_path = Path(os.environ.get("CODE_ACCOUNTS_DIR", str(Path.home() / ".code-accounts"))) / "accounts.json"
+            accounts = json.loads(accounts_path.read_text())["accounts"]
+            account = next((a for a in accounts if a["id"] == opts.account), None)
+            if not account:
+                parser.error("unknown Code account")
+            settings = t3_rpc_value(base, token, "server.getSettings", {})
+            plan = t3_provider_plan([account], settings)
+            if not plan["mappings"] or plan["additions"]:
+                parser.error("configure this account with `codespace t3 providers --apply` first")
+            instance_id = plan["mappings"][0]["instance"]
+            instance = settings.get("providerInstances", {}).get(instance_id)
+            cfg = (instance or {}).get("config") or settings.get("providers", {}).get(instance_id, {})
+            if (instance or {}).get("enabled", cfg.get("enabled", True)) is False:
+                parser.error("the selected T3 provider instance is disabled")
+            snapshot = t3_http(base, token, "/api/orchestration/shell")
+            project = next((p for p in snapshot["projects"] if os.path.realpath(p["workspaceRoot"]) == cwd), None)
+            project_id = project["id"] if project else "codespace-" + hashlib.sha256(cwd.encode()).hexdigest()[:32]
+            thread_id = "codespace-" + identity
+            created_at = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            selection = {"instanceId": instance_id, "model": opts.model}
+            commands = []
+            if not project:
+                commands.append({"type": "project.create", "commandId": "codespace-project-" + project_id,
+                                 "projectId": project_id, "title": Path(cwd).name or cwd,
+                                 "workspaceRoot": cwd, "createdAt": created_at})
+            commands.append({"type": "thread.create", "commandId": identity + "-create", "threadId": thread_id,
+                             "projectId": project_id, "title": opts.title, "modelSelection": selection,
+                             "runtimeMode": "approval-required", "interactionMode": "default",
+                             "branch": None, "worktreePath": None, "createdAt": created_at})
+            commands.append({"type": "thread.turn.start", "commandId": identity + "-start", "threadId": thread_id,
+                             "message": {"messageId": identity + "-prompt", "role": "user", "text": prompt, "attachments": []},
+                             "modelSelection": selection, "runtimeMode": "approval-required",
+                             "interactionMode": "default", "createdAt": created_at})
+            record = {"requestId": request_id, "inputs": inputs, "commands": commands,
+                      "threadId": thread_id, "projectId": project_id, "providerInstanceId": instance_id}
+            private_json_write(record_path, record)
+        print("Codespace dispatch request: " + request_id, file=sys.stderr)
+        for command in record["commands"]:
+            t3_http(base, token, "/api/orchestration/dispatch", command)
+        print(json.dumps({key: record[key] for key in ("requestId", "threadId", "projectId", "providerInstanceId")}, indent=2))
+    return 0
+
+
 def t3(args):
     """Call the T3 instance on the execution host; never relocate native logins."""
     import urllib.error
@@ -480,8 +581,10 @@ def t3(args):
         if "--stopped" not in export_args and "--completed" not in export_args:
             export_args = [*export_args, "--completed"]
         return subprocess.call([require("code"), "thread-export", *export_args, "--deliver-t3"])
+    starting = args[:1] == ["start"]
+    inspecting = len(args) == 2 and args[0] in ("status", "stop")
     provider_sync = args in (["providers"], ["providers", "--apply"])
-    native = provider_sync or args == ["scan"] or (len(args) == 2 and args[0] == "import-project")
+    native = starting or inspecting or provider_sync or args == ["scan"] or (len(args) == 2 and args[0] == "import-project")
     if args != ["_receive"] and not native:
         raise SystemExit("usage: codespace t3 scan | providers [--apply] | import-project ID | import ACCOUNT SESSION [--stopped] [--model MODEL]")
     settings = config()
@@ -502,6 +605,17 @@ def t3(args):
             raise SystemExit("codespace: configure CODESPACE_T3_TOKEN or a private t3_token_file from `t3 auth session issue --token-only`") from None
     if not token or any(c.isspace() for c in token):
         raise SystemExit("codespace: invalid T3 session token")
+    if starting:
+        return t3_start(args[1:], base, token)
+    if inspecting:
+        import urllib.parse
+        if args[0] == "status":
+            result = t3_http(base, token, "/api/orchestration/threads/" + urllib.parse.quote(args[1], safe=""))
+        else:
+            import uuid, datetime
+            result = t3_http(base, token, "/api/orchestration/dispatch", {"type": "thread.session.stop", "commandId": str(uuid.uuid4()), "threadId": args[1], "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")})
+        print(json.dumps(result, indent=2))
+        return 0
     if native:
         try:
             timeout = int(settings.get("t3_timeout_seconds", 180))
@@ -682,6 +796,8 @@ codespace job [args]          explicitly offload work to a Space worker
 codespace run [options] -- COMMAND  route portable work or keep Mac-dependent work local
 codespace menu [args]         install, update, or remove the Space menu app
 codespace find <query>        search this Mac, a peer Mac, and Space
+codespace t3 start --account ID --model MODEL --prompt TEXT [--cwd PATH]
+codespace t3 status|stop THREAD_ID  inspect or stop a dispatched thread
 codespace t3 connect           enroll renewable local T3 access
 codespace t3 renew             renew a managed token when due
 codespace t3 providers [--apply] map Code accounts into this host’s T3

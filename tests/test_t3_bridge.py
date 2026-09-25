@@ -191,6 +191,28 @@ class T3Bridge(unittest.TestCase):
         self.assertEqual([m["instance"] for m in plan["mappings"]], ["codex", "claudeAgent", "shadow"])
         self.assertEqual(plan["additions"], {})
 
+    def test_direct_dispatch_retries_use_identical_commands_and_reject_changed_request(self):
+        account_path = Path(os.environ["CODE_ACCOUNTS_DIR"]) / "accounts.json"
+        account_path.parent.mkdir(parents=True, exist_ok=True)
+        account_path.write_text(json.dumps({"accounts": [self.account]}))
+        settings = {"providerInstances": {"work": {"driver": "codex", "config": {"homePath": self.tmp.name}}}}
+        commands = []
+        def http(base, token, path, payload=None):
+            if path.endswith("/shell"):
+                return {"projects": []}
+            commands.append(payload)
+            return {"sequence": len(commands)}
+        args = ["--account", "codex-work", "--model", "test", "--cwd", self.tmp.name, "--request-id", "stable-request", "--prompt", "test prompt"]
+        with patch.object(self.client, "t3_rpc_value", return_value=settings), patch.object(self.client, "t3_http", side_effect=http), contextlib.redirect_stdout(io.StringIO()):
+            self.client.t3_start(args, "http://127.0.0.1:3773", "token")
+            self.client.t3_start(args, "http://127.0.0.1:3773", "token")
+            self.assertEqual(commands[:3], commands[3:])
+            self.assertEqual(commands[2]["type"], "thread.turn.start")
+            self.assertEqual(commands[2]["modelSelection"]["instanceId"], "work")
+            self.assertEqual(commands[2]["runtimeMode"], "approval-required")
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.client.t3_start([*args[:-1], "changed prompt"], "http://127.0.0.1:3773", "token")
+
 
 if __name__ == "__main__":
     unittest.main()

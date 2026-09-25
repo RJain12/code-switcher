@@ -110,6 +110,25 @@ through stdin and a single-use WebSocket ticket, not command-line arguments. Dis
 several minutes when provider history is stored on a network drive. `t3_timeout_seconds` in the
 Codespace config controls the request deadline (default 180 seconds, maximum 1800).
 
+### Dispatch an agent directly into T3
+
+```sh
+codespace t3 start --account codex-yt --model gpt-6-astra --cwd /path/to/repo --prompt 'Inspect the failing test'
+codespace on mini t3 start --account codex-default --model gpt-6-astra --cwd /path/on/mini --prompt 'Inspect the failing test'
+codespace t3 status THREAD_ID
+codespace t3 stop THREAD_ID
+```
+
+The thread is created in that host's running T3 server and uses the mapped Code account. Normal T3
+clients connected to the host can see it immediately. Dispatch defaults to approval-required mode;
+resolve approvals in T3. The returned ID confirms submission, not successful provider execution—use
+`status` to inspect completion, quota errors, and the response. `--prompt -` reads the task from stdin.
+
+Use `--request-id YOUR_ID` to retry an interrupted submission without creating another thread or turn.
+The same ID must carry the same account, workspace, model, title, and prompt. Local dispatch receipts
+are private files under `~/.config/codespace/dispatches/`. Provider usage limits and login requirements
+still apply; select another configured account when necessary.
+
 ### Renewable local T3 connections
 
 `codespace t3 connect` enrolls this Mac using the installed T3 app's admin CLI and verifies the new token
