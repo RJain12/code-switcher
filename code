@@ -33,6 +33,10 @@ CACHE_TTL = 90
 HANDOFFS = os.path.join(DATA, "handoffs")
 LAST_SESSION = os.path.join(DATA, "last-session.json")
 EFFORT_LOG = os.path.join(DATA, "effort.log")
+ARES_ROOT = os.path.join(DATA, "astra-ares")
+ARES_SOURCE = os.path.join(ARES_ROOT, "source")
+ARES_HOME = os.path.join(ARES_ROOT, "data")
+ARES_COMMIT = "b2011446d88202329dcdc5163500ca818aba9dbb"
 KEYCHAIN_SERVICE = "code-switcher"
 
 CLAUDE_SHARED = ["settings.json", "CLAUDE.md", "agents", "commands", "skills", "plugins", "keybindings.json", "statusline.sh"]
@@ -1127,6 +1131,88 @@ def jev_key(db):
     return (key_get(a) if a else None) or os.environ.get("OPENROUTER_API_KEY")
 
 
+def ares_binary():
+    return os.path.join(ARES_HOME, "bin", "codex")
+
+
+def ensure_ares_installed():
+    """Install the pinned native Codex patch once, without replacing ordinary codex."""
+    if os.path.isfile(ares_binary()):
+        return
+    if not shutil.which("node") or not shutil.which("npm") or not shutil.which("git"):
+        sys.exit("Jev's in-chat display needs Node 22+, npm and git to build Astra-Ares.")
+    os.makedirs(ARES_ROOT, mode=0o700, exist_ok=True)
+    with open(os.path.join(ARES_ROOT, ".install.lock"), "w") as lock:
+        print("code: checking the Jev native build (another `code` window may already be building it)", flush=True)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.isfile(ares_binary()):
+            return
+        try:
+            if not os.path.isfile(os.path.join(ARES_SOURCE, "bin", "ares.mjs")):
+                subprocess.run(["git", "clone", "--filter=blob:none", "https://github.com/miuuyy/Astra-Ares.git", ARES_SOURCE], check=True)
+            subprocess.run(["git", "checkout", "--detach", ARES_COMMIT], cwd=ARES_SOURCE, check=True)
+            subprocess.run(["npm", "ci", "--omit=dev"], cwd=ARES_SOURCE, check=True)
+            env = dict(os.environ, ARES_HOME=ARES_HOME,
+                       ARES_CONFIG=os.path.join(ARES_ROOT, "install-config.json"))
+            env["PATH"] = os.path.join(HOME, ".cargo", "bin") + os.pathsep + env.get("PATH", "")
+            if not shutil.which("cargo", path=env["PATH"]):
+                sys.exit("Jev's native patch needs Rust. Install rustup from https://rustup.rs, then run `code jev on` again.")
+            print("code: building Astra-Ares's patched Codex for in-chat Jev updates (first launch only)", flush=True)
+            subprocess.run(["node", "bin/ares.mjs", "setup"], cwd=ARES_SOURCE, env=env, check=True)
+        except subprocess.CalledProcessError as e:
+            sys.exit(f"code: Jev native build failed during {e.cmd[0]}; fix the error above and retry `code jev on`.")
+
+
+def ares_launch(acct, key):
+    """Return the Ares entry point and isolated environment for this Codex account."""
+    config = os.path.join(ARES_ROOT, f"{acct['id']}.json")
+    os.makedirs(ARES_ROOT, mode=0o700, exist_ok=True)
+    data = {"provider": "openrouter", "apiKeyEnv": "CODE_SWITCHER_JEV_KEY",
+            "maxLeaseSteps": 10, "codexHome": home_of(acct)}
+    tmp = config + f".{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, config)
+    env = env_for(acct)
+    env.update(ARES_HOME=ARES_HOME, ARES_CONFIG=config, CODE_SWITCHER_JEV_KEY=key)
+    return shutil.which("node"), [os.path.join(ARES_SOURCE, "bin", "astra-ares.mjs")], env
+
+
+def ares_model(acct, args):
+    """Keep the underlying GPT-6 model selected by Codex or the account."""
+    model = None
+    for i, arg in enumerate(args):
+        if arg in ("-m", "--model") and i + 1 < len(args):
+            model = args[i + 1]
+        elif arg.startswith("--model="):
+            model = arg.split("=", 1)[1]
+    if not model:
+        try:
+            with open(os.path.join(home_of(acct), "config.toml")) as f:
+                for line in f:
+                    match = re.match(r'^model\s*=\s*["\']([^"\']+)', line)
+                    if match:
+                        model = match.group(1)
+                        break
+        except OSError:
+            pass
+    return {"gpt-6-astra": "Astra-Jev", "gpt-6-sol": "Sol-Jev",
+            "gpt-6-luna": "Luna-Jev"}.get(model or "gpt-6-astra")
+
+
+def without_model_arg(args):
+    out, skip = [], False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg in ("-m", "--model"):
+            skip = True
+        elif not arg.startswith("--model="):
+            out.append(arg)
+    return out
+
+
 # ---------- supervised sessions + handoff ----------
 
 CONTINUE_NATIVE = ("The previous account hit its usage limit, so this session was moved to a different account. "
@@ -1313,7 +1399,17 @@ def supervise(db, acct, args, handoff=None, cwd=None, session_id=None):
     elif not session_id:
         args, session_id = fresh_session_args(acct, args)
     proxy = None
-    if auto_effort_ok(acct, args):
+    launch_env = env_for(acct)
+    native_jev = jev_key(db) if auto_effort_ok(acct, args) else None
+    selected_ares_model = ares_model(acct, args) if native_jev else None
+    if native_jev and selected_ares_model:
+        ensure_ares_installed()
+        binary, prefix, launch_env = ares_launch(acct, native_jev)
+        if not binary:
+            sys.exit("Jev's in-chat display needs Node 22+.")
+        # Ares activates its checkpoint only for its logical model selections.
+        args = prefix + ["-m", selected_ares_model] + without_model_arg(args)
+    elif auto_effort_ok(acct, args):
         proxy = EffortProxy(acct["id"], jev_key(db), acct.get("effort_range"))
         args = proxy.codex_args() + args
     mutate(db, lambda d: d.update(last=acct["id"]))
@@ -1331,7 +1427,7 @@ def supervise(db, acct, args, handoff=None, cwd=None, session_id=None):
     for sig in (signal.SIGTERM, signal.SIGHUP):
         saved[sig] = signal.signal(sig, forward)
     try:
-        child = subprocess.Popen([binary] + args, env=env_for(acct), cwd=cwd)
+        child = subprocess.Popen([binary] + args, env=launch_env, cwd=cwd)
         while child.poll() is None:
             try:
                 child.wait(timeout=2)
@@ -2214,6 +2310,7 @@ def cmd_effort(db, argv):
             sys.exit("Jev runs on OpenRouter. Add a key first (`code add openrouter jev`) or set OPENROUTER_API_KEY.")
         if acct_id and not (find(db, acct_id) or {}).get("provider") == "openrouter":
             sys.exit(f"{acct_id} isn't an OpenRouter account")
+        ensure_ares_installed()
         mutate(db, lambda d: d.update(jev={"enabled": True, "account": acct_id}))
         print(f"Jev on (key from {acct_id or 'OPENROUTER_API_KEY'}). Each decision sends a trimmed, redacted view of "
               "the current turn to OpenRouter/TypeSafe; ~$0.0004 per decision, reused for up to 10 steps.")

@@ -183,18 +183,20 @@ So auto-effort applies to **Codex accounts with a ChatGPT login using GPT-6 mode
 
 The local rules are simple. [Jev](https://openrouter.ai/typesafe/jev-1.13) is a model trained for this exact decision: which effort is enough for the next step, and for how many steps that stays true. Turn it on with `code effort jev on`. It uses the key from one of your OpenRouter accounts, or `OPENROUTER_API_KEY`.
 
-How `code` uses it:
-- **Leases.** Each answer includes a "lease" of 1, 2, 5 or 10 steps, and Jev isn't consulted again until the lease runs out. A lease ends early on a new user message, a new tool failure, a detected loop, or a compaction.
-- **Limits and validation.** Jev only chooses among the levels your range allows. Replies that don't come from the pinned `typesafe/jev-1.13` model are rejected.
-- **Fallback.** If Jev errors or times out (10 s), that step uses the local rules. After 3 failures in a row, Jev is paused for 10 minutes so it can't slow the session down.
-- **Cost.** About $0.042 per million input tokens with free output, so roughly $0.0004 per decision. `code effort` shows the running total and your cache hit rate.
+When Jev is enabled, `code` installs a pinned [Astra-Ares](https://github.com/miuuyy/Astra-Ares) native Codex patch on first use. The first build needs Rust and can take several minutes. Jev sessions run that separate binary with the selected account's existing `CODEX_HOME`; the normal `codex` command is untouched. Confirmed effort changes appear in Codex's chat transcript (for example, `Jev LOW → HIGH ✓ APPLIED`). Turn Jev off to use the normal Codex binary again. An already-running session keeps its current binary until it exits and is resumed through `code`.
 
-**Privacy:** each decision sends a trimmed view of the current turn to OpenRouter and TypeSafe. That's your latest prompts, the agent's messages and reasoning summaries, and the last 6 tool calls with outputs capped at about 4 KB. Common secrets are redacted first: API keys, tokens, private keys, JWTs, `password=`… This is why Jev is off until you enable it. The prompt wording is adapted from [Astra-Ares](https://github.com/miuuyy/Astra-Ares) (MIT).
+How `code` uses it:
+- **Leases.** Ares keeps a choice for 1, 2, 5 or 10 generations. New input or a tool failure ends the lease early.
+- **Confirmation.** The in-chat `APPLIED` message is emitted only after native Codex confirms the chosen effort.
+- **Errors.** Ares reports provider failures visibly; it does not silently use the local heuristic. When Jev is off, `code` uses its own proxy and local heuristic.
+- **Logs.** Native decisions are saved under `~/.code-accounts/astra-ares/data/runs/`. `code effort` reports the older proxy's log and cache statistics.
+
+**Privacy:** Jev receives bounded task context, including the current request and recent public tool results. See [Ares's context limits](https://github.com/miuuyy/Astra-Ares/blob/main/docs/architecture.md). This is why Jev is off until you enable it.
 
 ## Known limitations
 
-- **Codex sessions and the resume picker.** Codex's resume picker filters sessions by provider. Sessions started with auto-effort use the provider name `code_switcher`, so they show up when you resume through `code` but not in a plain `codex resume` picker. `codex resume <id>` still works. Codex has no setting that would let the proxy keep the name `openai` without an 8-second WebSocket fallback delay per session.
-- **Dynamic effort acceptance.** Whether ChatGPT's backend accepts the inserted effort updates hasn't been confirmed with live traffic yet. If it rejects them, the proxy resends the original request and turns auto-effort off for that session, so the worst case is ordinary Codex.
+- **Codex sessions and the resume picker.** Sessions started with local auto-effort when Jev is off use the provider name `code_switcher`, so they show up when you resume through `code` but not in a plain `codex resume` picker. `codex resume <id>` still works. Jev's native patched Codex uses the normal OpenAI provider.
+- **Dynamic effort acceptance.** The local proxy used with Jev off falls back to ordinary Codex if an inserted update is rejected. Jev-on sessions use Ares's native checkpoint instead.
 - **Cursor and OpenCode.** They can't auto-hand-off *out* yet; see [Providers](#providers).
 - **Usage endpoints are undocumented.** They come from the official apps and may change. Failures show as an error on that account and never break launching.
 

@@ -82,6 +82,25 @@ class Storage(unittest.TestCase):
         self.assertEqual(self.m.find(db, "codex-default")["id"], "codex-default")
         self.assertIsNone(self.m.find(db, "default"))
 
+    def test_ares_launch_uses_isolated_account_and_ephemeral_key(self):
+        a = {"id": "codex-work", "provider": "codex", "name": "work", "home": os.path.join(self.m.DATA, "codex", "work")}
+        binary, args, env = self.m.ares_launch(a, "test-jev-key")
+        self.assertTrue(binary.endswith("node"))
+        self.assertTrue(args[0].endswith("bin/astra-ares.mjs"))
+        self.assertEqual(env["CODE_SWITCHER_JEV_KEY"], "test-jev-key")
+        self.assertEqual(env["CODEX_HOME"], a["home"])
+        with open(env["ARES_CONFIG"]) as f:
+            config = json.load(f)
+        self.assertEqual(config["codexHome"], a["home"])
+        self.assertEqual(config["apiKeyEnv"], "CODE_SWITCHER_JEV_KEY")
+        self.assertNotIn("test-jev-key", json.dumps(config))
+        os.makedirs(a["home"], exist_ok=True)
+        with open(os.path.join(a["home"], "config.toml"), "w") as f:
+            f.write('model = "gpt-6-sol"\n')
+        self.assertEqual(self.m.ares_model(a, []), "Sol-Jev")
+        self.assertEqual(self.m.ares_model(a, ["-m", "gpt-6-luna"]), "Luna-Jev")
+        self.assertEqual(self.m.without_model_arg(["-m", "gpt-6-sol", "--resume", "id"]), ["--resume", "id"])
+
 
 class Heuristic(unittest.TestCase):
     def setUp(self):
