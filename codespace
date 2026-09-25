@@ -782,6 +782,152 @@ def run_workload(args):
 
 
 
+BRIDGE_PEER_SCRIPT = r"""
+import json, os, pathlib, subprocess, sys
+request = json.load(sys.stdin)
+home = pathlib.Path.home()
+root = home / ".config/codespace/bridge" / request["alias"]
+root.mkdir(parents=True, exist_ok=True, mode=0o700)
+key = root / "client_ed25519"
+if not key.exists():
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
+if request["action"] == "configure":
+    alias = "codespace-" + request["alias"]
+    hosts = root / "known_hosts"
+    hosts.write_text(alias + " " + request["hostKey"].strip() + "\n")
+    hosts.chmod(0o600)
+    ssh = home / ".ssh"
+    ssh.mkdir(exist_ok=True, mode=0o700)
+    include = ssh / "codespace.conf"
+    begin, end = "# codespace:" + alias + ":begin", "# codespace:" + alias + ":end"
+    content = include.read_text() if include.exists() else ""
+    block = '\n'.join([begin, 'Host ' + alias, '  HostName 127.0.0.1', '  Port ' + str(request['port']),
+        '  User ' + request['user'], '  IdentityFile "' + str(key) + '"', '  IdentitiesOnly yes',
+        '  HostKeyAlias ' + alias, '  UserKnownHostsFile "' + str(hosts) + '"',
+        '  StrictHostKeyChecking yes', '  BatchMode yes', end])
+    if begin in content and end in content:
+        start, finish = content.index(begin), content.index(end) + len(end)
+        content = content[:start] + block + content[finish:]
+    else:
+        content = content.rstrip() + '\n' + block + '\n'
+    include.write_text(content)
+    include.chmod(0o600)
+    config = ssh / 'config'
+    original = config.read_text() if config.exists() else ''
+    directive = 'Include ~/.ssh/codespace.conf'
+    if directive not in original.splitlines():
+        config.write_text(directive + '\n' + original)
+        config.chmod(0o600)
+    settings_file = home / '.config/codespace/config.json'
+    settings = json.loads(settings_file.read_text()) if settings_file.exists() else {}
+    settings.setdefault('hosts', {})[request['alias']] = alias
+    temporary = settings_file.with_suffix('.bridge-tmp')
+    temporary.write_text(json.dumps(settings, indent=2) + '\n')
+    temporary.chmod(0o600)
+    temporary.replace(settings_file)
+print(json.dumps({'publicKey': key.with_suffix('.pub').read_text().strip()}))
+"""
+
+
+def bridge(args):
+    import argparse
+    import getpass
+    import plistlib
+    import re
+    import shlex
+    parser = argparse.ArgumentParser(prog="codespace bridge")
+    parser.add_argument("action", choices=["enable", "disable", "status"])
+    parser.add_argument("peer", nargs="?")
+    parser.add_argument("--port", type=int, default=42322)
+    opts = parser.parse_args(args)
+    root = CONFIG.parent / "bridge"
+    metadata = root / "connection.json"
+    domain = "gui/" + str(os.getuid())
+    labels = ["com.codespace.bridge-sshd", "com.codespace.bridge-tunnel"]
+    agents = Path.home() / "Library/LaunchAgents"
+    def loaded(label):
+        return subprocess.run(["launchctl", "print", domain + "/" + label], capture_output=True).returncode == 0
+    if opts.action == "status":
+        record = json.loads(metadata.read_text()) if metadata.exists() else {}
+        print(json.dumps({**record, "services": {label: loaded(label) for label in labels}}, indent=2))
+        return 0
+    if opts.action == "disable":
+        for label in reversed(labels):
+            if loaded(label):
+                subprocess.run(["launchctl", "bootout", domain + "/" + label], check=True, capture_output=True)
+            (agents / (label + ".plist")).unlink(missing_ok=True)
+        print("Codespace reverse bridge disabled")
+        return 0
+    if sys.platform != "darwin" or not opts.peer or not 1024 <= opts.port <= 65535:
+        parser.error("enable requires a peer on macOS and a port from 1024 to 65535")
+    settings = config()
+    alias = settings.get("self_alias") or re.sub(r"[^a-z0-9_-]", "-", socket.gethostname().lower().removesuffix(".local"))[:40]
+    if not re.fullmatch(r"[a-z0-9_-]{1,40}", alias):
+        parser.error("self_alias must be a short lowercase SSH alias")
+    peer = settings.get("hosts", {}).get(opts.peer, opts.peer)
+    if not isinstance(peer, str) or not peer or peer.startswith("-") or any(c.isspace() for c in peer):
+        parser.error("invalid peer SSH host")
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    def peer_setup(action, **extra):
+        result = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=8", peer,
+            "python3 -c " + shlex.quote(BRIDGE_PEER_SCRIPT)],
+            input=json.dumps({"action": action, "alias": alias, **extra}).encode(),
+            capture_output=True, timeout=30)
+        if result.returncode:
+            raise ValueError("peer bridge setup failed: " + result.stderr.decode(errors="replace").strip())
+        return json.loads(result.stdout)
+    public = peer_setup("key")["publicKey"]
+    host_key = root / "host_ed25519"
+    if not host_key.exists():
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(host_key)], check=True)
+    authorized = root / "authorized_keys"
+    authorized.write_text('no-agent-forwarding,no-X11-forwarding ' + public + '\n')
+    authorized.chmod(0o600)
+    user = getpass.getuser()
+    configuration = root / "sshd_config"
+    configuration.write_text(f'''Port {opts.port}
+ListenAddress 127.0.0.1
+HostKey {host_key}
+PidFile {root}/sshd.pid
+AuthorizedKeysFile {authorized}
+AllowUsers {user}
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AuthenticationMethods publickey
+UsePAM no
+PermitRootLogin no
+AllowAgentForwarding no
+AllowTcpForwarding local
+PermitOpen 127.0.0.1:3773 localhost:3773
+X11Forwarding no
+PermitTunnel no
+LogLevel ERROR
+Subsystem sftp /usr/libexec/sftp-server
+''')
+    configuration.chmod(0o600)
+    subprocess.run(["/usr/sbin/sshd", "-t", "-f", str(configuration)], check=True, capture_output=True)
+    peer_setup("configure", port=opts.port, user=user, hostKey=host_key.with_suffix(".pub").read_text())
+    commands = [["/usr/sbin/sshd", "-D", "-e", "-f", str(configuration)],
+        ["/usr/bin/ssh", "-N", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+         "-o", "StrictHostKeyChecking=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+         "-R", f"127.0.0.1:{opts.port}:127.0.0.1:{opts.port}", peer]]
+    agents.mkdir(parents=True, exist_ok=True)
+    for label, command in zip(labels, commands):
+        if loaded(label):
+            subprocess.run(["launchctl", "bootout", domain + "/" + label], check=True, capture_output=True)
+        path = agents / (label + ".plist")
+        data = {"Label": label, "ProgramArguments": command, "KeepAlive": True, "RunAtLoad": True,
+                "ThrottleInterval": 15, "ProcessType": "Background",
+                "StandardOutPath": str(root / (label + ".log")), "StandardErrorPath": str(root / (label + ".log"))}
+        path.write_bytes(plistlib.dumps(data)); path.chmod(0o600)
+        subprocess.run(["launchctl", "enable", domain + "/" + label], check=True, capture_output=True)
+        subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=True, capture_output=True)
+    record = {"peer": peer, "aliasOnPeer": "codespace-" + alias, "port": opts.port, "localBind": "127.0.0.1"}
+    private_json_write(metadata, record)
+    print(json.dumps(record, indent=2))
+    return 0
+
+
 def dispatch(argv):
     if not argv or argv[0] in ("code", "local"):
         args = argv[1:] if argv else []
@@ -791,6 +937,7 @@ def dispatch(argv):
     if command in ("-h", "--help", "help"):
         print("""codespace [code args]       start Code locally
 codespace on <host> [args]    start Code on a trusted Mac over SSH
+codespace bridge enable PEER | disable | status  reconnecting reverse Mac access
 codespace space [args]        run the Space CLI on this Mac
 codespace job [args]          explicitly offload work to a Space worker
 codespace run [options] -- COMMAND  route portable work or keep Mac-dependent work local
@@ -812,6 +959,8 @@ Aliases for `on` live in ~/.config/codespace/config.json:
   {"hosts":{"mini":"clawdbot@Clawdbots-Mac-mini.local"}}
 Local work stays local unless you choose `on` or `job`.""")
         return 0
+    if command == "bridge":
+        return bridge(args)
     if command == "on":
         if not args:
             raise SystemExit("usage: codespace on <host-or-alias> [code args]")

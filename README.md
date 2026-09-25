@@ -64,6 +64,29 @@ in Space and referenced as `/space/...` in cloud commands. Local execution with 
 a durable workspace under `~/.local/share/codespace/jobs/`; without attachments it uses your current
 directory. Commands are passed as argument lists; use `bash -lc '...'` explicitly for shell syntax.
 
+### Reverse access between Macs
+
+When the MacBook can SSH to the mini, enable a reconnecting reverse connection on the MacBook:
+
+```sh
+codespace bridge enable mini
+codespace bridge status
+# On the mini, using the MacBook's configured self_alias:
+codespace on macbook t3 providers
+# On the MacBook, stop the connection:
+codespace bridge disable
+```
+
+Set a unique `self_alias` in `~/.config/codespace/config.json` before setup; otherwise the hostname
+is used. Setup requires an existing trusted SSH connection to the peer. It generates a dedicated
+key on the peer, pins the MacBook host key, and installs two user launch agents on the MacBook.
+The SSH listener and reverse port bind only to loopback. The peer gains shell and file access as
+your MacBook user through `codespace-ALIAS`; existing SSH configuration is preserved. File transfer
+uses the same Codespace host mapping. The connection retries after interruptions while both Macs
+are awake and reachable. `status` reports service registration, not an end-to-end connectivity check.
+One reverse peer is supported per Mac; use a distinct `--port` for each MacBook sharing a mini.
+Disabling stops the services and retains keys and peer configuration for re-enrollment.
+
 ### Managed CLI updates
 
 ```sh
