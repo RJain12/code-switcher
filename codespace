@@ -26,7 +26,8 @@ def config():
 
 
 def require(name):
-    binary = shutil.which(name)
+    sibling = Path(__file__).resolve().parent / name
+    binary = str(sibling) if name == "code" and sibling.is_file() and os.access(sibling, os.X_OK) else shutil.which(name)
     if not binary:
         raise SystemExit(f"codespace: {name} is not installed on this Mac")
     return binary
@@ -207,6 +208,7 @@ Local work stays local unless you choose `on` or `job`.""")
         remote = " ".join(shlex.quote(x) for x in ["$HOME/.local/bin/codespace", *code_args])
         # Do not quote $HOME itself: it must expand on the remote Mac.
         remote = remote.replace("'$HOME/.local/bin/codespace'", '"$HOME/.local/bin/codespace"', 1)
+        remote = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; ' + remote
         tty = ["-tt"] if sys.stdin.isatty() and sys.stdout.isatty() else ["-T"]
         return subprocess.call(["ssh", *tty, "-o", "ConnectTimeout=8", host, remote])
     if command == "t3":
