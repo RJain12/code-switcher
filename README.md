@@ -87,6 +87,11 @@ are awake and reachable. `status` reports service registration, not an end-to-en
 One reverse peer is supported per Mac; use a distinct `--port` for each MacBook sharing a mini.
 Disabling stops the services and retains keys and peer configuration for re-enrollment.
 
+Configured GCS machine catalogs also refresh during hourly/login maintenance. New local account
+names become discoverable after each machine's next successful refresh. Failed listings or partial
+downloads preserve the previous complete local catalog and report an error; token renewal and
+CLI updates still run independently. This synchronizes discovery, not provider credentials.
+
 ### Managed CLI updates
 
 ```sh

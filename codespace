@@ -183,7 +183,7 @@ def require(name):
     return binary
 
 
-def sync(args):
+def sync(args, quiet=False):
     if args not in ([], ["status"]):
         raise SystemExit("usage: codespace sync [status]")
     uri = config().get("sync_uri")
@@ -235,7 +235,9 @@ def sync(args):
     if uri:
         listed = subprocess.run([gcloud, "storage", "ls", uri.rstrip("/") + "/"],
                                 capture_output=True, text=True, timeout=30, env=cloud_env)
-        paths = [line for line in listed.stdout.splitlines() if line.endswith(".json")] if listed.returncode == 0 else []
+        if listed.returncode:
+            raise ValueError("machine catalog listing failed; cached machines were preserved")
+        paths = [line for line in listed.stdout.splitlines() if line.endswith(".json")]
     else:
         paths = list(CATALOG.glob("*.json")) if CATALOG.exists() else []
     for path in paths:
@@ -247,15 +249,15 @@ def sync(args):
             else:
                 content = path.read_text()
             record = json.loads(content)
-            if record.get("version") == 1:
-                machines.append(record)
-        except (OSError, ValueError, subprocess.SubprocessError):
-            continue
+            if not isinstance(record, dict) or record.get("version") != 1 or not isinstance(record.get("machine"), str):
+                raise ValueError("invalid machine record")
+            machines.append(record)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            raise ValueError("machine catalog read failed; cached machines were preserved") from error
     machines.sort(key=lambda item: item.get("alias") or item.get("machine") or "")
-    CATALOG_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    CATALOG_CACHE.write_text(json.dumps(machines, indent=2) + "\n")
-    CATALOG_CACHE.chmod(0o600)
-    print(json.dumps(machines, indent=2))
+    private_json_write(CATALOG_CACHE, machines)
+    if not quiet:
+        print(json.dumps(machines, indent=2))
     return 0
 
 
@@ -458,7 +460,13 @@ def renew_t3_connection(if_needed=False):
 
 def maintenance():
     results = {}
-    for name, action in (("t3", lambda: renew_t3_connection(if_needed=True)), ("update", lambda: update([]))):
+    def refresh_catalog():
+        if not config().get("sync_uri"):
+            return {"status": "not-configured"}
+        sync([], quiet=True)
+        return {"status": "synchronized"}
+    for name, action in (("t3", lambda: renew_t3_connection(if_needed=True)),
+                         ("sync", refresh_catalog), ("update", lambda: update([]))):
         try:
             results[name] = {"ok": True, "result": action()}
         except (Exception, SystemExit) as error:
