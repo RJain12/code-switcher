@@ -57,6 +57,49 @@ class ConnectionHealth(unittest.TestCase):
             run.assert_not_called()
             verify.assert_not_called()
 
+    def test_unreachable_lan_name_falls_back_to_next_address(self):
+        settings = {'hosts': {'mini': ['me@mini.local', 'me@mini.tail.ts.net']}}
+        attempts = []
+
+        def connect(address, timeout):
+            attempts.append(address[0])
+            if address[0] == 'mini.local':
+                raise OSError('nodename nor servname provided')
+            return unittest.mock.MagicMock()
+
+        with patch.object(self.app.socket, 'create_connection', side_effect=connect):
+            self.assertEqual(self.app.reachable_host('mini', settings), 'me@mini.tail.ts.net')
+        self.assertEqual(attempts, ['mini.local', 'mini.tail.ts.net'])
+
+    def test_candidates_merge_config_and_catalog_without_duplicates_or_unsafe_hosts(self):
+        Path(self.app.CATALOG_CACHE).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.app.CATALOG_CACHE).write_text(json.dumps([
+            {'alias': 'mini', 'ssh_host': 'me@a', 'ssh_hosts': ['me@a', 'me@b', '-oProxyCommand=x']},
+            {'alias': 'other', 'ssh_host': 'me@z'}]))
+        self.assertEqual(self.app.host_candidates('mini', {'hosts': {'mini': 'me@a'}}), ['me@a', 'me@b'])
+        self.assertEqual(self.app.host_candidates('other', {}), ['me@z'])
+        self.assertEqual(self.app.host_candidates('plain.example', {}), ['plain.example'])
+
+    def test_peer_report_names_the_address_used(self):
+        remote = {'version': 1, 'machine': 'mini', 'checks': {'t3': {'status': 'authenticated'}}}
+        with patch.object(self.app, 'config', return_value={'hosts': {'mini': ['me@down', 'me@up']}}), \
+                patch.object(self.app, 'verify_t3_token'), \
+                patch.object(self.app, 'reachable_host', return_value='me@up'), \
+                patch.object(self.app.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, json.dumps(remote), '')) as run:
+            peer = self.app.connection_report()['checks']['peer:mini']
+        self.assertEqual(peer['via'], 'me@up')
+        self.assertEqual(run.call_args.args[0][-2], 'me@up')
+
+    def test_bridge_tunnel_tries_each_address_in_order(self):
+        log = Path(self.tmp.name) / 'ssh.log'
+        fake = Path(self.tmp.name) / 'fake ssh'
+        fake.write_text(f'#!/bin/sh\nfor last; do :; done\necho "$last" >> "{log}"\nexit 255\n')
+        fake.chmod(0o755)
+        command = self.app.bridge_tunnel_command(['me@first', "me@it's-second"], 42322, ssh=str(fake))
+        self.assertNotEqual(subprocess.run(command, timeout=10).returncode, 0)
+        self.assertEqual(log.read_text().splitlines(), ['me@first', "me@it's-second"])
+        self.assertIn('ExitOnForwardFailure=yes', command[2])
+
     def test_cloud_catalog_probe_is_read_only(self):
         with patch.object(self.app, 'config', return_value={'sync_uri': 'gs://fixture/machines'}), patch.object(self.app, 'verify_t3_token'), patch.object(self.app, 'require', return_value='gcloud'), patch.object(self.app.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
             self.assertEqual(self.app.connection_report()['checks']['cloudCatalog']['status'], 'accessible')

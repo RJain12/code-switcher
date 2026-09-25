@@ -183,6 +183,68 @@ def require(name):
     return binary
 
 
+def valid_ssh_host(host):
+    return isinstance(host, str) and bool(host) and not host.startswith("-") and not any(c.isspace() for c in host)
+
+
+def host_candidates(alias, settings=None):
+    """SSH targets for an alias, in preference order: config entries, then the synced catalog."""
+    settings = config() if settings is None else settings
+    configured = settings.get("hosts", {}).get(alias)
+    candidates = configured if isinstance(configured, list) else [configured] if configured else []
+    try:
+        for machine in json.loads(CATALOG_CACHE.read_text()):
+            if machine.get("alias") == alias:
+                candidates += machine.get("ssh_hosts") or [machine.get("ssh_host")]
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    unique = []
+    for host in candidates:
+        if valid_ssh_host(host) and host not in unique:
+            unique.append(host)
+    if unique or configured:
+        return unique
+    return [alias] if valid_ssh_host(alias) else []
+
+
+def self_ssh_hosts():
+    """Addresses peers can use to reach this Mac: Tailscale first (works off-LAN), then Bonjour."""
+    import getpass
+    user = getpass.getuser()
+    hosts = []
+    for binary in (shutil.which("tailscale"), "/Applications/Tailscale.app/Contents/MacOS/Tailscale"):
+        if binary and Path(binary).exists():
+            try:
+                status = json.loads(subprocess.run([binary, "status", "--json"], capture_output=True,
+                                                   text=True, timeout=5).stdout)
+                name = status.get("Self", {}).get("DNSName", "").rstrip(".")
+                if name:
+                    hosts.append(f"{user}@{name}")
+            except (OSError, ValueError, subprocess.TimeoutExpired, AttributeError):
+                pass
+            break
+    try:
+        local = subprocess.run(["scutil", "--get", "LocalHostName"], capture_output=True, text=True, timeout=5).stdout.strip()
+        if local:
+            hosts.append(f"{user}@{local}.local")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return hosts
+
+
+def reachable_host(alias, settings=None, timeout=3):
+    """First candidate whose SSH port answers; name resolution for `.local` can fail while Tailscale works."""
+    candidates = host_candidates(alias, settings)
+    for host in candidates:
+        hostname = host.rsplit("@", 1)[-1]
+        try:
+            socket.create_connection((hostname, 22), timeout=timeout).close()
+            return host
+        except OSError:
+            continue
+    return candidates[0] if candidates else None
+
+
 def connection_report(local_only=False):
     """Probe configured connections without starting agents, renewing, or publishing."""
     import concurrent.futures
@@ -210,8 +272,9 @@ def connection_report(local_only=False):
         except urllib.error.HTTPError as error:
             return {"status": "rejected" if error.code in (401, 403) else "unavailable", "httpStatus": error.code}
 
-    def peer(host):
-        if not isinstance(host, str) or not host or host.startswith("-") or any(c.isspace() for c in host):
+    def peer(alias):
+        host = reachable_host(alias, settings)
+        if not valid_ssh_host(host):
             return {"status": "invalid-config"}
         command = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; "$HOME/.local/bin/codespace" doctor --local'
         result = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
@@ -221,7 +284,7 @@ def connection_report(local_only=False):
             report = json.loads(result.stdout)
             if report.get("version") != 1 or not isinstance(report.get("checks"), dict):
                 raise ValueError("unsupported health response")
-            return {"status": "reachable", "machine": report["machine"],
+            return {"status": "reachable", "machine": report["machine"], "via": host,
                     "t3": report["checks"]["t3"], "release": report.get("release")}
         except (ValueError, KeyError, TypeError, AttributeError):
             return {"status": "unavailable", "detail": "SSH or the remote Codespace health command failed"}
@@ -251,8 +314,8 @@ def connection_report(local_only=False):
     actions = {"t3": local_t3}
     if not local_only:
         actions["cloudCatalog"] = cloud_catalog
-        for alias, host in settings.get("hosts", {}).items():
-            actions["peer:" + alias] = lambda host=host: peer(host)
+        for alias in settings.get("hosts", {}):
+            actions["peer:" + alias] = lambda alias=alias: peer(alias)
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         futures = {name: pool.submit(checked, action) for name, action in actions.items()}
         checks = {name: future.result() for name, future in futures.items()}
@@ -302,8 +365,10 @@ def sync(args, quiet=False):
             t3_id = t3_id_path.read_text().strip()[:200]
         except OSError:
             t3_id = None
+        ssh_hosts = [h for h in [settings.get("ssh_host"), *self_ssh_hosts()] if valid_ssh_host(h)]
+        ssh_hosts = list(dict.fromkeys(ssh_hosts))
         record = {"version": 1, "machine": host, "alias": settings.get("self_alias"),
-                  "ssh_host": settings.get("ssh_host"), "profiles": profiles,
+                  "ssh_host": ssh_hosts[0] if ssh_hosts else None, "ssh_hosts": ssh_hosts, "profiles": profiles,
                   "t3_environment_id": t3_id, "space": bool(shutil.which("space")),
                   "updated_at": time.time()}
         if uri:
@@ -1058,6 +1123,16 @@ print(json.dumps({'publicKey': key.with_suffix('.pub').read_text().strip()}))
 """
 
 
+def bridge_tunnel_command(peers, port, ssh="/usr/bin/ssh"):
+    """launchd restarts this loop, so each pass retries every address (e.g. Tailscale, then LAN)."""
+    import shlex
+    tunnel = [ssh, "-N", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+              "-o", "StrictHostKeyChecking=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15",
+              "-o", "ServerAliveCountMax=3", "-R", f"127.0.0.1:{port}:127.0.0.1:{port}"]
+    loop = 'for host in "$@"; do ' + " ".join(shlex.quote(part) for part in tunnel) + ' "$host"; done'
+    return ["/bin/sh", "-c", loop, "codespace-bridge", *peers]
+
+
 def bridge(args):
     import argparse
     import getpass
@@ -1093,8 +1168,9 @@ def bridge(args):
     alias = settings.get("self_alias") or re.sub(r"[^a-z0-9_-]", "-", socket.gethostname().lower().removesuffix(".local"))[:40]
     if not re.fullmatch(r"[a-z0-9_-]{1,40}", alias):
         parser.error("self_alias must be a short lowercase SSH alias")
-    peer = settings.get("hosts", {}).get(opts.peer, opts.peer)
-    if not isinstance(peer, str) or not peer or peer.startswith("-") or any(c.isspace() for c in peer):
+    peers = host_candidates(opts.peer, settings)
+    peer = reachable_host(opts.peer, settings)
+    if not valid_ssh_host(peer):
         parser.error("invalid peer SSH host")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     def peer_setup(action, **extra):
@@ -1137,9 +1213,7 @@ Subsystem sftp /usr/libexec/sftp-server
     subprocess.run(["/usr/sbin/sshd", "-t", "-f", str(configuration)], check=True, capture_output=True)
     peer_setup("configure", port=opts.port, user=user, hostKey=host_key.with_suffix(".pub").read_text())
     commands = [["/usr/sbin/sshd", "-D", "-e", "-f", str(configuration)],
-        ["/usr/bin/ssh", "-N", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
-         "-o", "StrictHostKeyChecking=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
-         "-R", f"127.0.0.1:{opts.port}:127.0.0.1:{opts.port}", peer]]
+                bridge_tunnel_command([peer, *[p for p in peers if p != peer]], opts.port)]
     agents.mkdir(parents=True, exist_ok=True)
     for label, command in zip(labels, commands):
         if loaded(label):
@@ -1151,7 +1225,7 @@ Subsystem sftp /usr/libexec/sftp-server
         path.write_bytes(plistlib.dumps(data)); path.chmod(0o600)
         subprocess.run(["launchctl", "enable", domain + "/" + label], check=True, capture_output=True)
         subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=True, capture_output=True)
-    record = {"peer": peer, "aliasOnPeer": "codespace-" + alias, "port": opts.port, "localBind": "127.0.0.1"}
+    record = {"peer": peer, "peers": [peer, *[p for p in peers if p != peer]], "aliasOnPeer": "codespace-" + alias, "port": opts.port, "localBind": "127.0.0.1"}
     private_json_write(metadata, record)
     print(json.dumps(record, indent=2))
     return 0
@@ -1190,7 +1264,7 @@ codespace update [--install | --rollback | --status] manage paired CLI releases
 codespace auto-update enable|disable|status          hourly macOS updates
 
 Aliases for `on` live in ~/.config/codespace/config.json:
-  {"hosts":{"mini":"clawdbot@Clawdbots-Mac-mini.local"}}
+  {"hosts":{"mini":["clawdbot@mini.tailnet.ts.net","clawdbot@Clawdbots-Mac-mini.local"]}}\nThe first address whose SSH port answers is used.
 Local work stays local unless you choose `on` or `job`.""")
         return 0
     if command == "bridge":
@@ -1200,18 +1274,9 @@ Local work stays local unless you choose `on` or `job`.""")
     if command == "on":
         if not args:
             raise SystemExit("usage: codespace on <host-or-alias> [code args]")
-        host, *code_args = args
-        alias = host
-        host = config().get("hosts", {}).get(host, host)
-        if host == alias:
-            try:
-                for machine in json.loads(CATALOG_CACHE.read_text()):
-                    if machine.get("alias") == alias and machine.get("ssh_host"):
-                        host = machine["ssh_host"]
-                        break
-            except (OSError, ValueError):
-                pass
-        if not isinstance(host, str) or host.startswith("-") or any(c.isspace() for c in host):
+        alias, *code_args = args
+        host = reachable_host(alias)
+        if not valid_ssh_host(host):
             raise SystemExit("codespace: invalid SSH host")
         # SSH command arguments are parsed by the remote shell. Quote the fixed
         # executable and every Code argument, including user prompts.
