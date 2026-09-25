@@ -168,13 +168,26 @@ history with a workspace identity guard. It does not start an agent turn. Use it
 CLI sessions for that workspace; this currently remains an explicit operation.
 Both workspace import commands reject provider instances whose history directories resolve to the
 same location. T3 0.0.42 otherwise imports that history under multiple account identities. Direct
-T3 dispatch remains available; automatic CLI-history handoff awaits account-specific import support.
+T3 dispatch remains available. Automatic CLI-history handoff requires the Codespace T3 fork.
 
 The Codespace T3 fork adds `agentSessions.importSelected`. With that fork installed,
 `codespace t3 handoff ACCOUNT SESSION_ID` imports one completed Code session while holding its
 account lease. Code requires an unchanged completion receipt and sends only session metadata;
 T3 reads the native history in place. Stock T3 does not support this command. There is no fallback
-to an unfiltered import, and automatic scheduling is not enabled yet.
+to an unfiltered import.
+
+Enable automatic handoff on each execution host after installing the fork and applying its provider
+mappings with `codespace t3 auto-import on`. Use `off` to disable background imports and `status` to
+inspect completion receipts and pending errors. This is off by default for stock T3 compatibility.
+Each completed Codex or Claude session starts a detached import attempt; hourly/login maintenance
+retries pending sessions. Active accounts and transcripts changed since their recorded exit are
+withheld. Import runs under the account lease and never starts an agent turn or copies credentials.
+
+`code thread-sync` explicitly processes up to ten pending sessions; `code thread-sync --status` only
+inspects them. Failed imports remain pending with a five-minute minimum retry delay. Older attempts
+yield to other pending sessions, and successful imports are remembered until the session completes
+another turn. A crash or lost response can repeat the same selected-session import, which is idempotent.
+Previously recorded completed sessions are included when automatic handoff is enabled.
 
 ### Dispatch an agent directly into T3
 

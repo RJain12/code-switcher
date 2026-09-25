@@ -469,8 +469,14 @@ def maintenance():
         if config().get("t3_auto_providers") is not True:
             return {"status": "not-configured"}
         return t3(["providers", "--apply"], quiet=True)
+    def refresh_threads():
+        if config().get("t3_auto_import") is not True:
+            return {"status": "not-configured"}
+        result = subprocess.run([sys.executable, require("code"), "thread-sync", "--auto"],
+                                capture_output=True, text=True, timeout=950, check=True)
+        return json.loads(result.stdout)
     for name, action in (("t3", lambda: renew_t3_connection(if_needed=True)),
-                         ("providers", refresh_providers), ("sync", refresh_catalog),
+                         ("providers", refresh_providers), ("threads", refresh_threads), ("sync", refresh_catalog),
                          ("update", lambda: update([]))):
         try:
             results[name] = {"ok": True, "result": action()}
@@ -661,6 +667,12 @@ def t3(args, quiet=False):
     import urllib.error
     import urllib.parse
     import urllib.request
+    if len(args) == 2 and args[0] == "auto-import" and args[1] in ("on", "off", "status"):
+        if args[1] != "status":
+            settings = config()
+            settings["t3_auto_import"] = args[1] == "on"
+            private_json_write(CONFIG, settings)
+        return subprocess.call([sys.executable, require("code"), "thread-sync", "--status"])
     if len(args) == 3 and args[0] == "handoff":
         return subprocess.call([require("code"), "thread-export", args[1], args[2], "--completed", "--deliver-native-t3"])
     if args in (["connect"], ["renew"]):
@@ -1079,6 +1091,7 @@ codespace t3 scan             discover native sessions using installed T3
 codespace t3 import-project ID import native history into an existing T3 project
 codespace t3 import-cwd PATH   create/reuse a T3 project and import native CLI history
 codespace t3 handoff ACCOUNT SESSION  import one completed Code session (Codespace T3 fork)
+codespace t3 auto-import on|off|status  automatic completed-session handoff (Codespace T3 fork)
 codespace t3 import ...       import one stopped session (preview bridge required)
 codespace sync [status]        publish or inspect nonsecret machine/provider profiles
 codespace update [--install | --rollback | --status] manage paired CLI releases
