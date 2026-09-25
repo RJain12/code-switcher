@@ -1135,9 +1135,46 @@ def ares_binary():
     return os.path.join(ARES_HOME, "bin", "codex")
 
 
+def patch_ares_model_names():
+    """Keep Ares selection IDs internal; show the actual GPT-6 model in its UI."""
+    builds = glob.glob(os.path.join(ARES_HOME, "build", "*", "source", "codex-rs"))
+    if len(builds) != 1:
+        sys.exit("code: expected one Astra-Ares Codex source build")
+    rust = builds[0]
+    path = os.path.join(rust, "protocol", "src", "openai_models.rs")
+    with open(path) as f:
+        source = f.read()
+    for old, new in (("Astra Ares", "gpt-6-astra"), ("Sol Ares", "gpt-6-sol"),
+                     ("Luna Ares", "gpt-6-luna")):
+        source = source.replace(f'"{old}"', f'"{new}"')
+    with open(path, "w") as f:
+        f.write(source)
+    launcher = os.path.join(ARES_SOURCE, "src", "launch.mjs")
+    with open(launcher) as f:
+        js = f.read()
+    for old, new in (("Astra Ares", "gpt-6-astra"), ("Sol Ares", "gpt-6-sol"),
+                     ("Luna Ares", "gpt-6-luna")):
+        js = js.replace(f'"{old}"', f'"{new}"')
+    with open(launcher, "w") as f:
+        f.write(js)
+    env = dict(os.environ)
+    env["PATH"] = os.path.join(HOME, ".cargo", "bin") + os.pathsep + env.get("PATH", "")
+    env["CARGO_INCREMENTAL"] = "0"
+    if sys.platform == "darwin":
+        env["CARGO_PROFILE_DEV_SMALL_STRIP"] = "none"
+    subprocess.run(["cargo", "build", "--locked", "-p", "codex-cli", "--bin", "codex",
+                    "--profile", "dev-small", "-j", "2"], cwd=rust, env=env, check=True)
+    replacement = ares_binary() + f".{os.getpid()}.new"
+    shutil.copyfile(os.path.join(rust, "target", "dev-small", "codex"), replacement)
+    os.chmod(replacement, 0o755)
+    os.replace(replacement, ares_binary())
+    with open(os.path.join(ARES_HOME, "model-names-v2"), "w") as f:
+        f.write(ARES_COMMIT)
+
+
 def ensure_ares_installed():
     """Install the pinned native Codex patch once, without replacing ordinary codex."""
-    if os.path.isfile(ares_binary()):
+    if os.path.isfile(ares_binary()) and os.path.isfile(os.path.join(ARES_HOME, "model-names-v2")):
         return
     if not shutil.which("node") or not shutil.which("npm") or not shutil.which("git"):
         sys.exit("Jev's in-chat display needs Node 22+, npm and git to build Astra-Ares.")
@@ -1145,9 +1182,12 @@ def ensure_ares_installed():
     with open(os.path.join(ARES_ROOT, ".install.lock"), "w") as lock:
         print("code: checking the Jev native build (another `code` window may already be building it)", flush=True)
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if os.path.isfile(ares_binary()):
+        if os.path.isfile(ares_binary()) and os.path.isfile(os.path.join(ARES_HOME, "model-names-v2")):
             return
         try:
+            if os.path.isfile(ares_binary()):
+                patch_ares_model_names()
+                return
             if not os.path.isfile(os.path.join(ARES_SOURCE, "bin", "ares.mjs")):
                 subprocess.run(["git", "clone", "--filter=blob:none", "https://github.com/miuuyy/Astra-Ares.git", ARES_SOURCE], check=True)
             subprocess.run(["git", "checkout", "--detach", ARES_COMMIT], cwd=ARES_SOURCE, check=True)
@@ -1159,6 +1199,7 @@ def ensure_ares_installed():
                 sys.exit("Jev's native patch needs Rust. Install rustup from https://rustup.rs, then run `code jev on` again.")
             print("code: building Astra-Ares's patched Codex for in-chat Jev updates (first launch only)", flush=True)
             subprocess.run(["node", "bin/ares.mjs", "setup"], cwd=ARES_SOURCE, env=env, check=True)
+            patch_ares_model_names()
         except subprocess.CalledProcessError as e:
             sys.exit(f"code: Jev native build failed during {e.cmd[0]}; fix the error above and retry `code jev on`.")
 

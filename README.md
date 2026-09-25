@@ -195,6 +195,10 @@ How `code` uses it:
 
 ## Known limitations
 
+### Benchmark Jev against fixed effort
+
+Run `python3 bench/game_compare.py` to build the same standalone browser game twice: once with fixed medium effort and once with Jev, using the same patched Codex build. Set `BENCH_ACCOUNT=codex-<name>` for a different account. The command saves playable HTML files, raw Codex events, and a JSON metrics table under `bench/artifacts/`. It measures wall time, input/cache/output tokens, Jev charges, and an estimated GPT-6 Sol API-equivalent cost. The API equivalent is not an actual charge for ChatGPT subscription sessions. Play and inspect both games before judging quality; a single pair cannot establish average savings.
+
 - **Codex sessions and the resume picker.** Sessions started with local auto-effort when Jev is off use the provider name `code_switcher`, so they show up when you resume through `code` but not in a plain `codex resume` picker. `codex resume <id>` still works. Jev's native patched Codex uses the normal OpenAI provider.
 - **Dynamic effort acceptance.** The local proxy used with Jev off falls back to ordinary Codex if an inserted update is rejected. Jev-on sessions use Ares's native checkpoint instead.
 - **Cursor and OpenCode.** They can't auto-hand-off *out* yet; see [Providers](#providers).
