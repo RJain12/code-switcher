@@ -6,11 +6,13 @@ REPO_RAW="https://raw.githubusercontent.com/RJain12/code-switcher/main/code"
 mkdir -p "$PREFIX"
 if [ -f "$(dirname "$0")/code" ]; then
   cp "$(dirname "$0")/code" "$PREFIX/code"
+  cp "$(dirname "$0")/codespace" "$PREFIX/codespace"
 else
   curl -fsSL "$REPO_RAW" -o "$PREFIX/code"
+  curl -fsSL "https://raw.githubusercontent.com/RJain12/code-switcher/main/codespace" -o "$PREFIX/codespace"
 fi
-chmod +x "$PREFIX/code"
-echo "Installed to $PREFIX/code"
+chmod +x "$PREFIX/code" "$PREFIX/codespace"
+echo "Installed to $PREFIX/code and $PREFIX/codespace"
 case ":$PATH:" in *":$PREFIX:"*) ;; *) echo "Note: add $PREFIX to your PATH." ;; esac
 if command -v code >/dev/null 2>&1 && [ "$(command -v code)" != "$PREFIX/code" ]; then
   echo "Warning: another 'code' ($(command -v code)) is earlier on your PATH (e.g. the VS Code shell command)."

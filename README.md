@@ -22,7 +22,17 @@
 
 If you hit rate limits on one subscription, you can keep working on another. `code` keeps many logins signed in at the same time and launches whichever one you pick. When an agent runs out of usage mid-task, `code` hands the conversation to another account. For Codex, it also adjusts reasoning effort step by step without breaking the prompt cache.
 
+## Codespace (local first)
+
+`codespace` unifies Code and the Space CLI while keeping execution on the Mac where you start it. `codespace`
+starts the normal Code picker locally; `codespace on mini` launches Code on a configured Mac over SSH;
+`codespace job ask ...` explicitly sends work to a Space worker. `codespace menu` manages the Space menu app,
+and `codespace find <query>` searches files through that app's helper. Set trusted Mac aliases in
+`~/.config/codespace/config.json`, for example `{"hosts":{"mini":"user@mac-mini.local"}}`.
+Space remains a separate optional install for now.
+
 ## Features
+
 
 - **Six providers, many accounts each.** Every account gets its own isolated login.
 - **Live usage limits.** Where the provider exposes them, you see 5-hour, weekly and credit windows with reset times, plus Codex's banked resets. A ★ marks the account with the most room left.
