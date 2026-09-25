@@ -23,6 +23,7 @@ If you hit rate limits on one subscription, you can keep working on another. `co
 
 - **Interactive picker.** Run `code`, use the arrow keys (or `j`/`k`), and press Enter, or press `1`–`9` to launch an account directly.
 - **Multiple accounts per tool.** Link as many Claude Code and Codex accounts as you like. They all stay logged in at once.
+- **Automatic handoff when you run out.** If an agent launched through `code` hits its usage limit, `code` closes it and asks which account to continue on. The conversation carries over with it.
 - **Live usage limits.** Each account shows its 5-hour and weekly windows, the percent used, and when each window resets. A ★ marks the account with the most room left.
 - **Shared setup.** New accounts reuse your existing settings, skills, plugins, `config.toml` and `AGENTS.md`, so every account behaves the same way.
 - **No dependencies.** It's a single Python 3 file that uses only the standard library.
@@ -57,6 +58,7 @@ This installs to `~/.local/bin/code`. To install somewhere else, set `PREFIX=/us
 | `code <id> [args…]` | Launch an account directly, e.g. `code claude-work` |
 | `code login <id>` | Re-run login for an account |
 | `code rm <id>` | Remove an account and delete its stored login |
+| `code handoff` | Move your last session, with its context, to another account |
 | `code -- [args…]` | Open the picker and pass the args to the chosen tool |
 
 Keys in the picker:
@@ -70,6 +72,30 @@ Keys in the picker:
 | `d` | Remove the selected account |
 | `r` | Refresh usage |
 | `q` or `Esc` | Quit |
+
+## Running out of usage mid-conversation
+
+Agents launched through `code` (from the picker or with `code <id>`) are supervised. `code` tails the session log the agent writes. When a real usage-limit error shows up there, `code`:
+
+1. waits a few seconds so you can see the agent's own message, then closes the agent;
+2. opens a handoff picker with your other accounts, preselecting the one with the most room left;
+3. continues the same conversation on the account you choose.
+
+What happens to the conversation depends on where it's going:
+
+| From → to | How the context moves |
+| --- | --- |
+| Claude → Claude (another account) | **Native resume.** The session file is copied into the new account and opened with `claude --resume <id>`, so the full history, tool calls included, is intact. |
+| Anything → Codex, or Codex → Claude | **Transcript handoff.** The whole conversation is written to `~/.code-accounts/handoffs/<time>-<account>.md` (every message and tool call, with very long tool outputs trimmed). The new agent is started with a prompt telling it to read that file, plus the raw session log, and pick up where the last one stopped. |
+
+What counts as a usage-limit error:
+
+- **Claude:** an API error entry of type `billing_error`, or a `rate_limit` error while the account's 5-hour or weekly window is actually full. A brief rate-limit hiccup on its own won't trigger a handoff.
+- **Codex:** an entry marked `usage_limit_exceeded`.
+
+If you press `q` in the handoff picker, nothing is lost. Run `code handoff` later to move the session then, or any time you want to switch accounts before a limit hits.
+
+Agents you start directly with `claude` or `codex`, outside of `code`, are never watched or touched.
 
 ## How it works
 

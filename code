@@ -2,10 +2,13 @@
 """code — pick a Claude Code / Codex account (with live usage limits) and launch it."""
 import curses
 import datetime as dt
+import glob
 import hashlib
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -13,12 +16,15 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
+import uuid
 
 HOME = os.path.expanduser("~")
 DATA = os.path.join(HOME, ".code-accounts")
 DB = os.path.join(DATA, "accounts.json")
 CACHE = os.path.join(DATA, "usage-cache.json")
 CACHE_TTL = 90
+HANDOFFS = os.path.join(DATA, "handoffs")
+LAST_SESSION = os.path.join(DATA, "last-session.json")
 
 PROVIDERS = {
     "claude": {"label": "Claude", "bin": "claude", "env": "CLAUDE_CONFIG_DIR", "default_home": os.path.join(HOME, ".claude"),
@@ -245,14 +251,338 @@ def remove_account(db, acct):
         shutil.rmtree(acct["home"], ignore_errors=True)
 
 
-def launch(db, acct, args):
+# ---------- supervised sessions + handoff ----------
+
+CLAUDE_SESSION_FLAGS = {"-r", "--resume", "-c", "--continue", "--session-id", "--fork-session", "-p", "--print"}
+
+CONTINUE_NATIVE = ("The previous account hit its usage limit, so this session was moved to a different account. "
+                   "Continue exactly where you left off.")
+
+CONTINUE_TRANSCRIPT = (
+    "You are taking over a conversation that started in {src} and stopped because that account hit its usage limit. "
+    "The full transcript is in {path} (long tool outputs are trimmed; the raw session log is {raw}). "
+    "Read the transcript first, then continue exactly where it left off: briefly say where things stand, "
+    "then keep going on the last unfinished request. Don't redo work that is already done; check the files on disk if unsure."
+)
+
+
+def claude_project_dir(home, cwd):
+    return os.path.join(home, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
+
+
+def first_json(path):
+    try:
+        with open(path) as f:
+            return json.loads(f.readline())
+    except (OSError, ValueError):
+        return {}
+
+
+def limit_signal(provider, d):
+    """Return a reason string if this transcript entry is a usage-limit error."""
+    if provider == "claude":
+        if d.get("isApiErrorMessage") and d.get("error") in ("rate_limit", "billing_error"):
+            return d["error"]
+        return None
+    p = d.get("payload")
+    if not isinstance(p, dict):
+        return None
+    for blob in (p, p.get("error")):
+        if isinstance(blob, dict) and "usage_limit" in json.dumps(blob.get("codex_error_info") or ""):
+            return "usage_limit_exceeded"
+    return None
+
+
+def confirm_exhausted(acct, reason):
+    if reason in ("billing_error", "usage_limit_exceeded"):
+        return True
+    # A Claude "rate_limit" can be a transient 429; only switch if a plan window is actually full.
+    info = fetch_usage(acct)
+    return any(w["pct"] >= 99.5 for w in info.get("windows") or [])
+
+
+class SessionWatcher:
+    """Finds the transcript the child agent is writing and tails it for usage-limit errors."""
+
+    def __init__(self, acct, cwd, start, session_id=None):
+        self.acct, self.cwd, self.start, self.session_id = acct, cwd, start, session_id
+        self.path, self.pos = None, 0
+
+    def _candidates(self):
+        home = home_of(self.acct)
+        if self.acct["provider"] == "claude":
+            if self.session_id:
+                hits = glob.glob(os.path.join(home, "projects", "*", self.session_id + ".jsonl"))
+                if hits:
+                    return hits
+            return glob.glob(os.path.join(claude_project_dir(home, self.cwd), "*.jsonl"))
+        days = {dt.date.fromtimestamp(t) for t in (self.start - 86400, self.start, time.time())}
+        files = []
+        for d in days:
+            files += glob.glob(os.path.join(home, "sessions", f"{d:%Y/%m/%d}", "rollout-*.jsonl"))
+        return [f for f in files if (first_json(f).get("payload") or {}).get("cwd") == self.cwd]
+
+    def locate(self):
+        if not self.path:
+            cands = []
+            for f in self._candidates():
+                try:
+                    if os.path.getmtime(f) >= self.start - 2:
+                        cands.append(f)
+                except OSError:
+                    pass
+            if cands:
+                self.path = max(cands, key=os.path.getmtime)
+                if self.acct["provider"] == "claude":
+                    self.session_id = os.path.basename(self.path)[:-len(".jsonl")]
+        return self.path
+
+    def poll(self):
+        if not self.locate():
+            return None
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.pos)
+                data = f.read()
+        except OSError:
+            return None
+        end = data.rfind(b"\n")
+        if end < 0:
+            return None
+        self.pos += end + 1
+        found = None
+        for line in data[:end].splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("type") == "session_meta":
+                self.session_id = (d.get("payload") or {}).get("id") or self.session_id
+            try:
+                ts = iso_ts(d.get("timestamp"))
+            except ValueError:
+                ts = None
+            if ts and ts < self.start - 5:
+                continue  # history from a resumed session, not this run
+            found = limit_signal(self.acct["provider"], d) or found
+        return found
+
+
+def reset_terminal():
+    # The agent was killed mid-TUI; undo alt screen, hidden cursor, mouse/paste/keyboard modes.
+    sys.stdout.write("\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[>4;0m\r\n")
+    sys.stdout.flush()
+    subprocess.run(["stty", "sane"], stdin=sys.stdin)
+
+
+def stop_child(child):
+    child.terminate()
+    try:
+        child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait()
+    reset_terminal()
+
+
+def supervise(db, acct, args, handoff=None):
+    binary = shutil.which(PROVIDERS[acct["provider"]]["bin"])
+    if not binary:
+        sys.exit(f"'{PROVIDERS[acct['provider']]['bin']}' not found on PATH")
+    cwd = handoff["cwd"] if handoff and os.path.isdir(handoff.get("cwd") or "") else os.getcwd()
+    session_id = None
+    if handoff:
+        args, session_id = prepare_handoff(acct, handoff)
+    elif acct["provider"] == "claude" and not any(a.split("=")[0] in CLAUDE_SESSION_FLAGS for a in args):
+        session_id = str(uuid.uuid4())
+        args = ["--session-id", session_id] + args
     db["last"] = acct["id"]
     save_db(db)
-    binary = PROVIDERS[acct["provider"]]["bin"]
-    path = shutil.which(binary)
-    if not path:
-        sys.exit(f"'{binary}' not found on PATH")
-    os.execve(path, [binary] + args, env_for(acct))
+
+    start = time.time()
+    watcher = SessionWatcher(acct, cwd, start, session_id)
+    # The child owns the terminal; keep Ctrl+C / Ctrl+\ from killing the supervisor too.
+    saved = {s: signal.signal(s, lambda *_: None) for s in (signal.SIGINT, signal.SIGQUIT)}
+    hit = None
+    try:
+        child = subprocess.Popen([binary] + args, env=env_for(acct), cwd=cwd)
+        while child.poll() is None:
+            try:
+                child.wait(timeout=2)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            reason = watcher.poll()
+            if reason and confirm_exhausted(acct, reason):
+                hit = reason
+                time.sleep(3)  # let the agent's own "limit reached" message show
+                stop_child(child)
+                break
+        if not hit:
+            reason = watcher.poll()
+            if reason and confirm_exhausted(acct, reason):
+                hit = reason
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+
+    session = {"provider": acct["provider"], "account": acct["id"], "path": watcher.path,
+               "session_id": watcher.session_id, "cwd": cwd, "ended": time.time()}
+    if watcher.path:
+        os.makedirs(DATA, mode=0o700, exist_ok=True)
+        with open(LAST_SESSION, "w") as f:
+            json.dump(session, f)
+    rc = child.returncode
+    return (128 - rc if rc < 0 else rc), hit, session
+
+
+def run_session(db, acct, args, handoff=None):
+    while True:
+        rc, hit, session = supervise(db, acct, args, handoff)
+        if not hit:
+            return rc
+        label = PROVIDERS[acct["provider"]]["label"]
+        nxt = pick(db, {"exclude": acct["id"],
+                        "title": f"{label} '{acct['name']}' hit its usage limit. Continue this conversation on:"})
+        if not nxt:
+            print("Session saved. Continue it on another account later with: code handoff")
+            return rc
+        acct, args, handoff = nxt, [], session
+
+
+def prepare_handoff(target, h):
+    """Returns (args, claude_session_id) that start `target` with the handed-off conversation."""
+    if h["provider"] == "claude" and target["provider"] == "claude" and h.get("path") and h.get("session_id"):
+        src_dir = os.path.dirname(h["path"])
+        dst_dir = os.path.join(home_of(target), "projects", os.path.basename(src_dir))
+        os.makedirs(dst_dir, exist_ok=True)
+        if os.path.realpath(dst_dir) != os.path.realpath(src_dir):
+            shutil.copy2(h["path"], dst_dir)
+            side = os.path.join(src_dir, h["session_id"])  # subagent logs, saved tool outputs
+            if os.path.isdir(side):
+                shutil.copytree(side, os.path.join(dst_dir, h["session_id"]), dirs_exist_ok=True)
+        return ["--resume", h["session_id"], CONTINUE_NATIVE], h["session_id"]
+
+    src = f"{PROVIDERS[h['provider']]['label']} (account '{h['account']}')"
+    path = export_transcript(h, src)
+    prompt = CONTINUE_TRANSCRIPT.format(src=src, path=path, raw=h.get("path") or "unavailable")
+    if target["provider"] == "claude":
+        sid = str(uuid.uuid4())
+        return ["--session-id", sid, prompt], sid
+    return [prompt], None
+
+
+# ---------- transcript export ----------
+
+NOISE = ("<environment_context>", "<user_instructions>", "# AGENTS.md", "<permissions", "<INSTRUCTIONS>",
+         "<command-name>", "<local-command-stdout>", "<local-command-caveat>")
+
+
+def clip(s, n):
+    s = s.strip()
+    return s if len(s) <= n else s[:n] + f"\n… [{len(s) - n} more characters trimmed]"
+
+
+def content_parts(content):
+    if isinstance(content, str):
+        return [("text", content)]
+    out = []
+    for c in content or []:
+        if not isinstance(c, dict):
+            continue
+        t = c.get("type")
+        if t in ("text", "input_text", "output_text"):
+            out.append(("text", c.get("text", "")))
+        elif t == "tool_use":
+            out.append(("call", f"{c.get('name')} {json.dumps(c.get('input'), ensure_ascii=False)}"))
+        elif t == "tool_result":
+            r = c.get("content")
+            if isinstance(r, list):
+                r = "\n".join(x.get("text", "") for x in r if isinstance(x, dict) and x.get("type") == "text")
+            out.append(("result", str(r or "")))
+        elif t in ("image", "input_image"):
+            out.append(("text", "[image]"))
+    return out
+
+
+def claude_entries(path):
+    for line in open(path):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("isSidechain") or d.get("isMeta"):
+            continue
+        if d.get("type") == "summary":
+            yield "note", "Earlier summary: " + d.get("summary", "")
+        if d.get("type") not in ("user", "assistant"):
+            continue
+        parts = content_parts((d.get("message") or {}).get("content"))
+        if d.get("isApiErrorMessage"):
+            yield "note", "API error: " + " ".join(s for _, s in parts)
+            continue
+        for kind, s in parts:
+            yield (d["type"] if kind == "text" else kind), s
+
+
+def codex_entries(path):
+    for line in open(path):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        p = d.get("payload")
+        if not isinstance(p, dict):
+            continue
+        if d.get("type") != "response_item":
+            if limit_signal("codex", d):
+                err = p.get("error") if isinstance(p.get("error"), dict) else p
+                yield "note", "Usage limit: " + str(err.get("message", ""))
+            continue
+        pt = p.get("type")
+        if pt == "message" and p.get("role") in ("user", "assistant"):
+            for _, s in content_parts(p.get("content")):
+                yield p["role"], s
+        elif pt in ("function_call", "custom_tool_call"):
+            yield "call", f"{p.get('name')} {p.get('arguments') or p.get('input') or ''}"
+        elif pt in ("function_call_output", "custom_tool_call_output"):
+            out = p.get("output")
+            yield "result", out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+        elif pt == "local_shell_call":
+            yield "call", "shell " + json.dumps(p.get("action"), ensure_ascii=False)
+
+
+def export_transcript(h, src):
+    os.makedirs(HANDOFFS, mode=0o700, exist_ok=True)
+    out = os.path.join(HANDOFFS, f"{time.strftime('%Y%m%d-%H%M%S')}-{h['account']}.md")
+    entries = []
+    if h.get("path") and os.path.exists(h["path"]):
+        gen = claude_entries if h["provider"] == "claude" else codex_entries
+        entries = list(gen(h["path"]))
+    lines = [f"# Conversation handed off from {src}", "",
+             f"- Working directory: `{h['cwd']}`", f"- Raw session log: `{h.get('path')}`", ""]
+    last_role = None
+    for kind, s in entries:
+        if kind in ("user", "assistant"):
+            s = re.sub(r"<system-reminder>.*?</system-reminder>", "", s, flags=re.S).strip()
+            if not s or s.startswith(NOISE):
+                continue
+            if kind != last_role:
+                lines += ["", f"## {kind.title()}", ""]
+                last_role = kind
+            lines += [s, ""]
+        elif kind == "call":
+            lines += ["**Tool call:**", "````", clip(s, 2000), "````", ""]
+        elif kind == "result":
+            lines += ["**Tool result:**", "````", clip(s, 4000), "````", ""]
+        else:
+            lines += [f"> {clip(s, 1000)}", ""]
+    if not entries:
+        lines.append("_(No transcript could be read; check the raw session log above.)_")
+    with open(out, "w") as f:
+        f.write("\n".join(lines))
+    os.chmod(out, 0o600)
+    return out
 
 
 # ---------- picker UI ----------
@@ -277,7 +607,7 @@ def headroom(info):
     return max(w["pct"] for w in info["windows"])
 
 
-def picker(stdscr, db, usage, state):
+def picker(stdscr, db, usage, state, handoff=None):
     curses.curs_set(0)
     curses.use_default_colors()
     for i, c in enumerate((curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_RED, curses.COLOR_CYAN, curses.COLOR_MAGENTA), 1):
@@ -286,9 +616,13 @@ def picker(stdscr, db, usage, state):
     DIM, BOLD = curses.A_DIM, curses.A_BOLD
     stdscr.timeout(250)
 
-    accts = db["accounts"]
+    def visible():
+        return [a for a in db["accounts"] if not handoff or a["id"] != handoff["exclude"]]
+
+    accts = visible()
     ids = [a["id"] for a in accts]
-    sel = ids.index(db["last"]) if db.get("last") in ids else 0
+    sel = ids.index(db["last"]) if db.get("last") in ids and not handoff else 0
+    auto_sel = bool(handoff)  # in handoff mode, follow the best account until the user moves
     message = ""
 
     def color_for(p):
@@ -306,20 +640,29 @@ def picker(stdscr, db, usage, state):
                     pass
             return x + len(text)
 
-        put(0, 2, "code", BOLD | CYAN)
-        put(0, 7, "pick an account to launch", DIM)
-        keys = "enter launch  a add  d remove  l re-login  r refresh  q quit"
+        top = 2
+        if handoff:
+            put(0, 2, handoff["title"], BOLD | YELLOW)
+            put(1, 2, "Enter continues with the full conversation · q stops here", DIM)
+            top = 3
+            keys = "enter continue  a add  l re-login  r refresh  q quit"
+        else:
+            put(0, 2, "code", BOLD | CYAN)
+            put(0, 7, "pick an account to launch", DIM)
+            keys = "enter launch  a add  d remove  l re-login  r refresh  q quit"
         put(h - 1, 2, keys, DIM)
         if message:
             put(h - 2, 2, message, YELLOW)
 
         if not accts:
-            put(2, 4, "No accounts yet. Press 'a' to add one.")
+            put(top, 4, "No other accounts. Press 'a' to add one." if handoff else "No accounts yet. Press 'a' to add one.")
         best = min(accts, key=lambda a: headroom(usage.get(a["id"])), default=None)
         best_id = best["id"] if best and headroom(usage.get(best["id"])) < 100 else None
+        if auto_sel and best_id:
+            sel = [a["id"] for a in accts].index(best_id)
 
         name_w = max([len(a["name"]) for a in accts] + [7])
-        y = 2
+        y = top
         for i, a in enumerate(accts):
             info = usage.get(a["id"])
             is_sel = i == sel
@@ -367,9 +710,9 @@ def picker(stdscr, db, usage, state):
         if k in (ord("q"), 27):
             return ("quit", None)
         if k in (curses.KEY_UP, ord("k")) and accts:
-            sel = (sel - 1) % len(accts)
+            sel, auto_sel = (sel - 1) % len(accts), False
         elif k in (curses.KEY_DOWN, ord("j")) and accts:
-            sel = (sel + 1) % len(accts)
+            sel, auto_sel = (sel + 1) % len(accts), False
         elif ord("1") <= k <= ord("9") and k - ord("1") < len(accts):
             return ("launch", accts[k - ord("1")])
         elif k in (10, 13, curses.KEY_ENTER) and accts:
@@ -380,7 +723,7 @@ def picker(stdscr, db, usage, state):
             return ("login", accts[sel])
         elif k == ord("r"):
             state["refresh"]()
-        elif k == ord("d") and accts:
+        elif k == ord("d") and accts and not handoff:
             a = accts[sel]
             if not a["home"]:
                 message = "The default account can't be removed here (it is your normal ~/.claude or ~/.codex login)."
@@ -391,13 +734,13 @@ def picker(stdscr, db, usage, state):
             stdscr.timeout(250)
             if ans in (ord("y"), ord("Y")):
                 remove_account(db, a)
-                accts = db["accounts"]
+                accts = visible()
                 sel = min(sel, max(0, len(accts) - 1))
                 message = f"Removed '{a['name']}'."
 
 
-def run_picker(args):
-    db = load_db()
+def pick(db, handoff=None):
+    """Show the picker until an account is chosen (returned) or the user quits (None)."""
     while True:
         cache = load_cache()
         usage = {a["id"]: cache[a["id"]] for a in db["accounts"] if a["id"] in cache}
@@ -422,7 +765,7 @@ def run_picker(args):
 
         state["refresh"] = refresh
         refresh(force=False)
-        action, acct = curses.wrapper(picker, db, usage, state)
+        action, acct = curses.wrapper(picker, db, usage, state, handoff)
 
         with lock:
             cache.update({k: v for k, v in usage.items() if "error" not in v or v["error"] != "not logged in"})
@@ -430,15 +773,35 @@ def run_picker(args):
             save_db(db)
 
         if action == "quit":
-            return
+            return None
         if action == "launch":
-            launch(db, acct, args)
+            return acct
         if action == "add":
             add_account(db)
             input("\nPress enter to return to the picker…")
         if action == "login":
             relogin(db, acct)
             input("\nPress enter to return to the picker…")
+
+
+def run_picker(args):
+    db = load_db()
+    acct = pick(db)
+    if acct:
+        sys.exit(run_session(db, acct, args))
+
+
+def handoff_last(db):
+    try:
+        with open(LAST_SESSION) as f:
+            h = json.load(f)
+    except (OSError, ValueError):
+        sys.exit("No session to hand off yet. Launch an agent through `code` first.")
+    src = find(db, h["account"])
+    name = f"{PROVIDERS[h['provider']]['label']} '{src['name'] if src else h['account']}'"
+    acct = pick(db, {"exclude": h["account"], "title": f"Move your last {name} session ({h['cwd']}) to:"})
+    if acct:
+        sys.exit(run_session(db, acct, [], handoff=h))
 
 
 def relogin(db, acct):
@@ -460,6 +823,10 @@ HELP = """usage:
   code login <id>             re-run login for an account
   code rm <id>                remove an account
   code <id> [args...]         launch an account directly (e.g. code claude-work)
+  code handoff                move your last session (with its context) to another account
+
+Agents launched through `code` are watched: if the account hits its usage limit, the agent is
+closed and you pick another account to continue the same conversation on.
 """
 
 
@@ -513,8 +880,10 @@ def main():
         else:
             remove_account(db, a)
             print(f"removed {a['id']}")
+    elif cmd in ("handoff", "switch"):
+        handoff_last(db)
     elif find(db, cmd):
-        launch(db, find(db, cmd), argv[1:])
+        sys.exit(run_session(db, find(db, cmd), argv[1:]))
     else:
         print(HELP)
         sys.exit(1)
