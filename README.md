@@ -56,6 +56,11 @@ keys, OAuth tokens, emails, or local credential paths. Provider login remains on
 Set `sync_uri` in the same config file to a `gs://.../machines` path to read and write the catalog through GCS
 directly when the mounted drive is slow.
 
+`code space doctor` checks the local T3 session, configured peer Macs over SSH, and access to the
+cloud catalog. `--local` checks only this host. The report includes a timestamp and returns a nonzero
+exit status for failed checks. It does not launch agents, change connections, or test provider quota.
+Peer checks require an existing trusted SSH host key and never open an interactive login prompt.
+
 
 ### Work placement
 

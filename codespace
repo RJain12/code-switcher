@@ -183,6 +183,97 @@ def require(name):
     return binary
 
 
+def connection_report(local_only=False):
+    """Probe configured connections without starting agents, renewing, or publishing."""
+    import concurrent.futures
+    import datetime
+    import urllib.error
+    import urllib.parse
+    settings = config()
+
+    def local_t3():
+        base = settings.get("t3_url", "http://127.0.0.1:3773")
+        url = urllib.parse.urlsplit(base)
+        if (url.scheme not in ("http", "https") or not url.hostname or url.username or url.password
+                or url.query or url.fragment or url.path not in ("", "/")
+                or (url.scheme == "http" and url.hostname not in ("127.0.0.1", "localhost", "::1"))):
+            return {"status": "invalid-config"}
+        token = os.environ.get("CODESPACE_T3_TOKEN")
+        if not token:
+            try:
+                token, _ = read_t3_token(Path(settings.get("t3_token_file", str(CONFIG.parent / "t3-token"))).expanduser())
+            except FileNotFoundError:
+                return {"status": "not-configured"}
+        try:
+            verify_t3_token(base, token)
+            return {"status": "authenticated"}
+        except urllib.error.HTTPError as error:
+            return {"status": "rejected" if error.code in (401, 403) else "unavailable", "httpStatus": error.code}
+
+    def peer(host):
+        if not isinstance(host, str) or not host or host.startswith("-") or any(c.isspace() for c in host):
+            return {"status": "invalid-config"}
+        command = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; "$HOME/.local/bin/codespace" doctor --local'
+        result = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                                 "-o", "StrictHostKeyChecking=yes", host, command],
+                                capture_output=True, text=True, timeout=25)
+        try:
+            report = json.loads(result.stdout)
+            if report.get("version") != 1 or not isinstance(report.get("checks"), dict):
+                raise ValueError("unsupported health response")
+            return {"status": "reachable", "machine": report["machine"],
+                    "t3": report["checks"]["t3"], "release": report.get("release")}
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return {"status": "unavailable", "detail": "SSH or the remote Codespace health command failed"}
+
+    def cloud_catalog():
+        uri = settings.get("sync_uri")
+        if not uri:
+            return {"status": "not-configured"}
+        if not isinstance(uri, str) or not uri.startswith("gs://") or any(c.isspace() for c in uri):
+            return {"status": "invalid-config"}
+        environment = dict(os.environ)
+        if Path("/opt/homebrew/bin/python3").exists():
+            environment.setdefault("CLOUDSDK_PYTHON", "/opt/homebrew/bin/python3")
+        result = subprocess.run([require("gcloud"), "storage", "ls", uri.rstrip("/") + "/"],
+                                capture_output=True, text=True, timeout=25, env=environment)
+        return {"status": "accessible" if result.returncode == 0 else "unavailable"}
+
+    def checked(action):
+        started = time.monotonic()
+        try:
+            result = action()
+        except (Exception, SystemExit) as error:
+            # Command output and exception messages can contain credentials or URLs.
+            result = {"status": "unavailable", "errorType": type(error).__name__}
+        return {**result, "durationMs": round((time.monotonic() - started) * 1000)}
+
+    actions = {"t3": local_t3}
+    if not local_only:
+        actions["cloudCatalog"] = cloud_catalog
+        for alias, host in settings.get("hosts", {}).items():
+            actions["peer:" + alias] = lambda host=host: peer(host)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {name: pool.submit(checked, action) for name, action in actions.items()}
+        checks = {name: future.result() for name, future in futures.items()}
+    current = RELEASE_ROOT / "current"
+    return {"version": 1, "machine": socket.gethostname(),
+            "checkedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "release": current.resolve().name if current.is_symlink() else None,
+            "checks": checks,
+            "scope": "Connection reachability and T3 authentication; provider login and quota are not tested"}
+
+
+def doctor(args):
+    if args not in ([], ["--local"]):
+        raise SystemExit("usage: codespace doctor [--local]")
+    report = connection_report(local_only=args == ["--local"])
+    print(json.dumps(report, indent=2))
+    failures = ("unavailable", "rejected", "invalid-config")
+    return int(any(check["status"] in failures or check.get("t3", {}).get("status") in failures
+                   for check in report["checks"].values()))
+
+
 def sync(args, quiet=False):
     if args not in ([], ["status"]):
         raise SystemExit("usage: codespace sync [status]")
@@ -1094,6 +1185,7 @@ codespace t3 handoff ACCOUNT SESSION  import one completed Code session (Codespa
 codespace t3 auto-import on|off|status  automatic completed-session handoff (Codespace T3 fork)
 codespace t3 import ...       import one stopped session (preview bridge required)
 codespace sync [status]        publish or inspect nonsecret machine/provider profiles
+codespace doctor [--local]     check live T3, peer Mac, and cloud catalog connections
 codespace update [--install | --rollback | --status] manage paired CLI releases
 codespace auto-update enable|disable|status          hourly macOS updates
 
@@ -1103,6 +1195,8 @@ Local work stays local unless you choose `on` or `job`.""")
         return 0
     if command == "bridge":
         return bridge(args)
+    if command == "doctor":
+        return doctor(args)
     if command == "on":
         if not args:
             raise SystemExit("usage: codespace on <host-or-alias> [code args]")
