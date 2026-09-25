@@ -219,9 +219,19 @@ def key_path(acct):
     return os.path.join(acct["home"], ".code-switcher-key")
 
 
+def keychain_locked():
+    """True in sessions (such as SSH) where the login keychain cannot be read without a prompt."""
+    if sys.platform != "darwin":
+        return False
+    return subprocess.run(["security", "show-keychain-info"], capture_output=True).returncode != 0
+
+
+# A keychain locked to SSH sessions falls back to the 0600 file used on other platforms.
 def key_get(acct):
     if sys.platform == "darwin":
-        return keychain_get(KEYCHAIN_SERVICE, acct["id"])
+        key = keychain_get(KEYCHAIN_SERVICE, acct["id"])
+        if key:
+            return key
     try:
         with open(key_path(acct)) as f:
             return f.read().strip() or None
@@ -230,18 +240,21 @@ def key_get(acct):
 
 
 def key_set(acct, key):
-    if sys.platform == "darwin":
-        subprocess.run(["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", acct["id"], "-w", key],
-                       check=True, capture_output=True)
-    else:
-        fd = os.open(key_path(acct), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(key)
+    if sys.platform == "darwin" and subprocess.run(
+            ["security", "add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", acct["id"], "-w", key],
+            capture_output=True).returncode == 0:
+        return
+    fd = os.open(key_path(acct), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(key)
 
 
 def key_del(acct):
     if sys.platform == "darwin":
         subprocess.run(["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", acct["id"]], capture_output=True)
+    if acct.get("home"):
+        with contextlib.suppress(OSError):
+            os.remove(key_path(acct))
 
 
 def env_for(acct):
@@ -2940,6 +2953,121 @@ def cmd_keep_fresh(db, args):
     return 1 if any(r["status"] == "failed" for r in results.values()) else 0
 
 
+# ---------- cross-machine account manifest ----------
+#
+# OAuth logins rotate their refresh token on use, so a copied login shares one session with its source
+# and whichever machine refreshes first signs the other out. Machines therefore exchange API keys only;
+# an OAuth account is linked by signing in on each machine, which gives it an independent session.
+
+def key_fingerprint(key):
+    return hashlib.sha256(key.encode()).hexdigest()[:12]
+
+
+def account_identity(acct):
+    """Stable identity shared by the same login on different machines, or None when unknown."""
+    if acct.get("keyed"):
+        key = key_get(acct)
+        return "key:" + key_fingerprint(key) if key else None
+    if acct["provider"] == "codex":
+        import base64
+        tokens = (codex_auth(acct) or {}).get("tokens") or {}
+        try:
+            payload = tokens["id_token"].split(".")[1]
+            email = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))).get("email")
+        except (KeyError, IndexError, ValueError, AttributeError):
+            email = None
+        return email and f"{email}/{tokens.get('account_id') or ''}"
+    if acct["provider"] == "claude":
+        if not claude_creds(acct):
+            return None
+        email = acct.get("email")
+        if not email and binary_for("claude"):
+            try:
+                r = subprocess.run([binary_for("claude"), "auth", "status", "--json"], capture_output=True,
+                                   text=True, env=env_for(acct), timeout=20)
+                email = json.loads(r.stdout).get("email")
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                email = None
+        return email
+    if acct["provider"] == "cursor":
+        return cursor_email(acct) if keychain_get("cursor-access-token", "cursor-user") else None
+    return None
+
+
+def account_login(acct):
+    if acct.get("keyed"):
+        return "ok" if key_get(acct) else "logged-out"
+    expiry = access_expiry(acct)
+    if expiry is not None:
+        return "ok" if time.time() - expiry < IDLE_AFTER_EXPIRY else "idle"
+    if acct["provider"] == "cursor":
+        return "ok" if keychain_get("cursor-access-token", "cursor-user") else "logged-out"
+    if acct["provider"] in ("grok", "opencode"):
+        return "logged-out" if FETCHERS[acct["provider"]](acct).get("error") else "ok"
+    return "logged-out"
+
+
+def cmd_accounts_manifest(db, args):
+    if args:
+        sys.exit("usage: code accounts-manifest")
+    locked = keychain_locked()
+    accounts = []
+    for acct in db["accounts"]:
+        expiry = access_expiry(acct)
+        login, identity = account_login(acct), account_identity(acct)
+        # Claude and Cursor browser logins live in the keychain, which SSH sessions cannot read.
+        if locked and login != "ok" and acct["provider"] in ("claude", "cursor") and not acct.get("keyed"):
+            login, identity = "unknown", None
+        accounts.append({"id": acct["id"], "provider": acct["provider"], "name": acct["name"],
+                         "keyed": bool(acct.get("keyed")), "model": acct.get("model"),
+                         "identity": identity, "login": login,
+                         "expires_in": round(expiry - time.time()) if expiry else None})
+    print(json.dumps({"version": 1, "machine": socket.gethostname(), "keychain_locked": locked,
+                      "generated_at": time.time(), "accounts": accounts}))
+    return 0
+
+
+def cmd_key_export(db, args):
+    acct = find(db, args[0]) if len(args) == 1 else None
+    if not acct or not acct.get("keyed"):
+        sys.exit("usage: code key-export <api-key account>")
+    key = key_get(acct)
+    if not key:
+        sys.exit(f"code: {acct['id']} has no stored key")
+    print(json.dumps({"provider": acct["provider"], "name": acct["name"], "model": acct.get("model"), "key": key}))
+    return 0
+
+
+def cmd_key_import(db, args):
+    """Register an API-key account from JSON on stdin; an account holding the same key is reused."""
+    if args:
+        sys.exit("usage: code key-import < account.json")
+    spec = json.loads(sys.stdin.read())
+    provider, key, name = spec.get("provider"), spec.get("key"), spec.get("name")
+    if provider not in ("openrouter", "cursor") or not isinstance(key, str) or not key.strip() \
+            or not isinstance(name, str) or not name.strip():
+        sys.exit("code: key-import needs provider (openrouter or cursor), name and key")
+    key = key.strip()
+    for acct in db["accounts"]:
+        if acct["provider"] == provider and acct.get("keyed") and key_get(acct) == key:
+            print(json.dumps({"id": acct["id"], "status": "exists"}))
+            return 0
+    taken = {a["id"] for a in read_db()["accounts"]}
+    base = f"{provider}-{slug(name)}"
+    aid = next(candidate for candidate in [base] + [f"{base}-{n}" for n in range(2, 100)] if candidate not in taken)
+    home = os.path.join(DATA, provider, aid[len(provider) + 1:])
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    link_shared(provider, home)
+    acct = {"id": aid, "provider": provider, "name": aid[len(provider) + 1:], "home": home, "keyed": True}
+    if provider == "openrouter":
+        acct["model"] = spec.get("model") or None
+    key_set(acct, key)
+    sync_claude_mcp(acct)
+    mutate(db, lambda d: d["accounts"].append(acct))
+    print(json.dumps({"id": aid, "status": "added"}))
+    return 0
+
+
 def main():
     argv = sys.argv[1:]
     if argv[:1] in (["-V"], ["--version"], ["version"]):
@@ -2998,6 +3126,12 @@ def main():
         sys.exit(cmd_doctor(db))
     elif cmd == "keep-fresh":
         sys.exit(cmd_keep_fresh(db, argv[1:]))
+    elif cmd == "accounts-manifest":
+        sys.exit(cmd_accounts_manifest(db, argv[1:]))
+    elif cmd == "key-export":
+        sys.exit(cmd_key_export(db, argv[1:]))
+    elif cmd == "key-import":
+        sys.exit(cmd_key_import(db, argv[1:]))
     elif find(db, cmd):
         sys.exit(run_session(db, find(db, cmd), argv[1:]))
     else:

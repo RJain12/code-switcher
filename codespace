@@ -417,6 +417,199 @@ def sync(args, quiet=False):
     return 0
 
 
+ACCOUNT_MANIFEST = RELEASE_ROOT / "accounts-manifest.json"
+REMOTE_PATH = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; '
+
+
+def remote_code(host, args, stdin=None, timeout=90):
+    import shlex
+    remote = REMOTE_PATH + '"$HOME/.local/bin/code" ' + " ".join(shlex.quote(a) for a in args)
+    return subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                           "-o", "StrictHostKeyChecking=yes", host, remote],
+                          input=stdin, capture_output=True, text=True, timeout=timeout)
+
+
+def merge_cached_manifest(manifest, cached):
+    """Fill keychain-locked entries from the manifest the logged-in session last wrote."""
+    if not isinstance(cached, dict):
+        return manifest
+    by_id = {a.get("id"): a for a in cached.get("accounts", []) if isinstance(a, dict)}
+    for account in manifest["accounts"]:
+        known = by_id.get(account["id"])
+        if account["login"] == "unknown" and known and known.get("login") != "unknown":
+            account.update(identity=known.get("identity"), login=known.get("login"),
+                           as_of=cached.get("generated_at"))
+    return manifest
+
+
+def local_manifest(write_cache=False):
+    result = subprocess.run([sys.executable, require("code"), "accounts-manifest"],
+                            capture_output=True, text=True, timeout=180, check=True)
+    manifest = json.loads(result.stdout)
+    if not manifest.get("keychain_locked"):
+        if write_cache:
+            private_json_write(ACCOUNT_MANIFEST, manifest)
+        return manifest
+    try:
+        cached = json.loads(ACCOUNT_MANIFEST.read_text())
+    except (OSError, ValueError):
+        cached = None
+    return merge_cached_manifest(manifest, cached)
+
+
+def peer_manifest(host):
+    result = remote_code(host, ["accounts-manifest"])
+    manifest = json.loads(result.stdout)
+    if manifest.get("version") != 1 or not isinstance(manifest.get("accounts"), list):
+        raise ValueError("unsupported account manifest")
+    if manifest.get("keychain_locked"):
+        cached = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host,
+                                 'cat "$HOME/.local/share/codespace/accounts-manifest.json"'],
+                                capture_output=True, text=True, timeout=30)
+        try:
+            merge_cached_manifest(manifest, json.loads(cached.stdout))
+        except ValueError:
+            pass
+    return manifest
+
+
+def self_alias(settings):
+    return settings.get("self_alias") or "local"
+
+
+def gather_manifests(write_cache=False):
+    """{alias: manifest or {"error": ...}} for this Mac and every configured peer."""
+    import concurrent.futures
+    settings = config()
+    jobs = {self_alias(settings): lambda: local_manifest(write_cache)}
+    for alias in settings.get("hosts", {}):
+        if alias != self_alias(settings):
+            jobs[alias] = lambda alias=alias: peer_manifest(reachable_host(alias, settings))
+    def run(job):
+        try:
+            return job()
+        except (Exception, SystemExit) as error:
+            return {"error": type(error).__name__}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {alias: pool.submit(run, job) for alias, job in jobs.items()}
+        return {alias: future.result() for alias, future in futures.items()}
+
+
+def account_plan(manifests):
+    """Group accounts by login identity and list what each reachable machine is missing."""
+    reachable = [alias for alias, m in manifests.items() if "accounts" in m]
+    groups = {}
+    for alias in reachable:
+        for account in manifests[alias]["accounts"]:
+            key = (account["provider"], account.get("identity") or f"?{alias}:{account['id']}")
+            group = groups.setdefault(key, {"provider": account["provider"], "identity": account.get("identity"),
+                                            "keyed": account.get("keyed", False), "machines": {}})
+            group["machines"][alias] = {k: account.get(k) for k in ("id", "login", "expires_in", "as_of")}
+    actions = []
+    for group in groups.values():
+        present = group["machines"]
+        healthy = [alias for alias, entry in present.items() if entry["login"] == "ok"]
+        for alias, entry in present.items():
+            if entry["login"] in ("logged-out", "idle"):
+                actions.append({"action": "sign-in-again", "machine": alias, "account": entry["id"],
+                                "command": f"codespace accounts link {alias} {entry['id']}"})
+        if not group["identity"] or not healthy:
+            continue
+        source = healthy[0]
+        for alias in reachable:
+            if alias in present:
+                continue
+            unverified = any(a["provider"] == group["provider"] and a["login"] == "unknown"
+                             for a in manifests[alias]["accounts"])
+            if group["keyed"]:
+                actions.append({"action": "copy-key", "machine": alias, "from": source,
+                                "account": present[source]["id"]})
+            elif not unverified:
+                actions.append({"action": "sign-in", "machine": alias, "account": present[source]["id"],
+                                "command": f"codespace accounts link {alias} {present[source]['id']}"})
+    ordered = sorted(groups.values(), key=lambda g: (g["provider"], g["identity"] or ""))
+    return {"machines": {alias: ({"error": m["error"]} if "error" in m else
+                                 {"keychain_locked": m.get("keychain_locked", False)})
+                         for alias, m in manifests.items()},
+            "accounts": ordered, "actions": actions}
+
+
+def run_code_on(alias, args, stdin=None):
+    settings = config()
+    if alias == self_alias(settings):
+        return subprocess.run([sys.executable, require("code"), *args], input=stdin,
+                              capture_output=True, text=True, timeout=90)
+    return remote_code(reachable_host(alias, settings), args, stdin=stdin)
+
+
+def copy_key(source, account_id, target):
+    exported = run_code_on(source, ["key-export", account_id])
+    if exported.returncode:
+        raise RuntimeError(f"{source} could not export {account_id}")
+    imported = run_code_on(target, ["key-import"], stdin=exported.stdout)
+    if imported.returncode:
+        raise RuntimeError(f"{target} rejected {account_id}: {imported.stderr.strip()[-200:]}")
+    return json.loads(imported.stdout)
+
+
+def accounts_sync(write_cache=False):
+    plan = account_plan(gather_manifests(write_cache))
+    results = []
+    for action in plan["actions"]:
+        if action["action"] != "copy-key":
+            continue
+        try:
+            outcome = copy_key(action["from"], action["account"], action["machine"])
+            results.append({**action, "status": outcome.get("status"), "id": outcome.get("id")})
+        except (Exception, SystemExit) as error:
+            results.append({**action, "status": "failed", "error": str(error)[:200]})
+    return {"copied": results,
+            "needs_sign_in": [a for a in plan["actions"] if a["action"] in ("sign-in", "sign-in-again")],
+            "machines": plan["machines"]}
+
+
+def accounts_link(alias, account_id):
+    settings = config()
+    manifests = gather_manifests()
+    target = manifests.get(alias)
+    if not target:
+        raise SystemExit(f"codespace: unknown machine '{alias}' (known: {', '.join(manifests)})")
+    if "error" in target:
+        raise SystemExit(f"codespace: {alias} is unreachable")
+    source = next((a for m in manifests.values() for a in m.get("accounts", []) if a["id"] == account_id), None)
+    if not source:
+        raise SystemExit(f"codespace: no machine has an account named {account_id}")
+    if source["keyed"]:
+        owner = next(name for name, m in manifests.items() if any(a["id"] == account_id for a in m.get("accounts", [])))
+        print(json.dumps(copy_key(owner, account_id, alias)))
+        return 0
+    existing = next((a for a in target["accounts"] if a["id"] == account_id), None)
+    code_args = ["login", account_id] if existing else ["add", source["provider"], source["name"]]
+    if alias == self_alias(settings):
+        return subprocess.call([sys.executable, require("code"), *code_args])
+    import shlex
+    host = reachable_host(alias, settings)
+    remote = REMOTE_PATH + '"$HOME/.local/bin/code" ' + " ".join(shlex.quote(a) for a in code_args)
+    # Codex completes its browser sign-in on the remote Mac's localhost:1455.
+    forward = ["-L", "1455:127.0.0.1:1455"] if source["provider"] == "codex" else []
+    print(f"Signing in to {source['provider']} as '{source['name']}' on {alias}. "
+          "Open the printed link in a browser here; this gives that Mac its own session.")
+    return subprocess.call(["ssh", "-tt", "-o", "ConnectTimeout=8", *forward, host, remote])
+
+
+def accounts(args):
+    if args in ([], ["status"]):
+        print(json.dumps(account_plan(gather_manifests()), indent=2))
+        return 0
+    if args == ["sync"]:
+        report = accounts_sync(write_cache=True)
+        print(json.dumps(report, indent=2))
+        return int(any(item["status"] == "failed" for item in report["copied"]))
+    if len(args) == 3 and args[0] == "link":
+        return accounts_link(args[1], args[2])
+    raise SystemExit("usage: codespace accounts [status | sync | link <machine> <account-id>]")
+
+
 T3_RPC_SCRIPT = r"""
 const chunks = [];
 for await (const chunk of process.stdin) chunks.push(chunk);
@@ -639,6 +832,7 @@ def maintenance():
         return json.loads(result.stdout)
     for name, action in (("t3", lambda: renew_t3_connection(if_needed=True)),
                          ("logins", keep_logins_fresh),
+                         ("accounts", lambda: accounts_sync(write_cache=True)),
                          ("providers", refresh_providers), ("threads", refresh_threads), ("sync", refresh_catalog),
                          ("update", lambda: update([]))):
         try:
@@ -1266,12 +1460,15 @@ codespace t3 handoff ACCOUNT SESSION  import one completed Code session (Codespa
 codespace t3 auto-import on|off|status  automatic completed-session handoff (Codespace T3 fork)
 codespace t3 import ...       import one stopped session (preview bridge required)
 codespace sync [status]        publish or inspect nonsecret machine/provider profiles
+codespace accounts [status | sync | link MACHINE ACCOUNT]
+                               compare provider accounts across Macs, copy API keys, sign in where missing
 codespace doctor [--local]     check live T3, peer Mac, and cloud catalog connections
 codespace update [--install | --rollback | --status] manage paired CLI releases
 codespace auto-update enable|disable|status          hourly macOS updates
 
 Aliases for `on` live in ~/.config/codespace/config.json:
-  {"hosts":{"mini":["clawdbot@mini.tailnet.ts.net","clawdbot@Clawdbots-Mac-mini.local"]}}\nThe first address whose SSH port answers is used.
+  {"hosts":{"mini":["clawdbot@mini.tailnet.ts.net","clawdbot@Clawdbots-Mac-mini.local"]}}
+The first address whose SSH port answers is used.
 Local work stays local unless you choose `on` or `job`.""")
         return 0
     if command == "bridge":
@@ -1306,6 +1503,8 @@ Local work stays local unless you choose `on` or `job`.""")
         return t3(args)
     if command == "sync":
         return sync(args)
+    if command == "accounts":
+        return accounts(args)
     if command in ("space", "job", "menu"):
         sub = args if command == "space" else ["job", *args] if command == "job" else ["menubar", *args]
         return subprocess.call([require("space"), *sub])
