@@ -109,6 +109,57 @@ def sync(args):
     return 0
 
 
+T3_RPC_SCRIPT = r"""
+const chunks = [];
+for await (const chunk of process.stdin) chunks.push(chunk);
+const input = JSON.parse(Buffer.concat(chunks).toString());
+let ws;
+const timer = setTimeout(() => fail("T3 RPC timed out"), 60000);
+function fail(message) {
+  clearTimeout(timer);
+  if (ws) ws.close();
+  process.stderr.write(message + "\n");
+  process.exit(1);
+}
+try {
+  if (typeof WebSocket !== "function") fail("T3 native RPC requires Node 22 or newer");
+  const response = await fetch(input.base + "/api/auth/websocket-ticket", {
+    method: "POST", headers: {Authorization: "Bearer " + input.token},
+    redirect: "manual", signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) fail("T3 ticket request failed (HTTP " + response.status + ")");
+  const ticket = (await response.json()).ticket;
+  if (typeof ticket !== "string" || !ticket) fail("T3 returned an invalid WebSocket ticket");
+  const url = new URL(input.base + "/ws");
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.searchParams.set("wsTicket", ticket);
+  ws = new WebSocket(url);
+  let finished = false;
+  ws.addEventListener("open", () => ws.send(JSON.stringify({
+    _tag: "Request", id: "1", tag: input.method, payload: input.payload, headers: [],
+  })));
+  ws.addEventListener("error", () => fail("T3 WebSocket connection failed"));
+  ws.addEventListener("close", () => { if (!finished) fail("T3 closed the connection before replying"); });
+  ws.addEventListener("message", event => {
+    try {
+      if (typeof event.data !== "string" || event.data.length > 32 * 1024 * 1024) fail("Invalid or oversized T3 response");
+      const decoded = JSON.parse(event.data);
+      for (const message of Array.isArray(decoded) ? decoded : [decoded]) {
+        if (message._tag === "Ping") { ws.send(JSON.stringify({_tag: "Pong"})); continue; }
+        if (message._tag === "Defect" || message._tag === "ClientProtocolError") fail("T3 rejected the RPC protocol");
+        if (message._tag !== "Exit" || String(message.requestId) !== "1") continue;
+        if (message.exit?._tag !== "Success") fail("T3 RPC failed: " + JSON.stringify(message.exit?.cause ?? []));
+        finished = true;
+        clearTimeout(timer);
+        process.stdout.write(JSON.stringify(message.exit.value) + "\n");
+        ws.close();
+      }
+    } catch { fail("Could not decode the T3 RPC response"); }
+  });
+} catch { fail("Could not connect to T3"); }
+"""
+
+
 def t3(args):
     """Call the T3 instance on the execution host; never relocate native logins."""
     import urllib.error
@@ -119,7 +170,8 @@ def t3(args):
         if "--stopped" not in export_args and "--completed" not in export_args:
             export_args = [*export_args, "--completed"]
         return subprocess.call([require("code"), "thread-export", *export_args, "--deliver-t3"])
-    if args != ["_receive"]:
+    native = args == ["scan"] or (len(args) == 2 and args[0] == "import-project")
+    if args != ["_receive"] and not native:
         raise SystemExit("usage: codespace t3 import <account> <session-id> [--stopped] [--model MODEL]")
     settings = config()
     base = settings.get("t3_url", "http://127.0.0.1:3773")
@@ -142,6 +194,16 @@ def t3(args):
             raise SystemExit("codespace: configure CODESPACE_T3_TOKEN or a private t3_token_file from `t3 auth session issue --token-only`") from None
     if not token or any(c.isspace() for c in token):
         raise SystemExit("codespace: invalid T3 session token")
+    if native:
+        method = "agentSessions.scan" if args == ["scan"] else "agentSessions.import"
+        payload = {} if args == ["scan"] else {"projectId": args[1]}
+        try:
+            return subprocess.run([require("node"), "--input-type=module", "-e", T3_RPC_SCRIPT],
+                                  input=json.dumps({"base": base.rstrip("/"), "token": token,
+                                                    "method": method, "payload": payload}).encode(),
+                                  timeout=65).returncode
+        except subprocess.TimeoutExpired:
+            raise SystemExit("codespace: native T3 RPC timed out") from None
     payload = sys.stdin.buffer.read(32 * 1024 * 1024 + 1)
     if len(payload) > 32 * 1024 * 1024:
         raise SystemExit("codespace: T3 history exceeds the 32 MiB transport limit")
@@ -183,7 +245,9 @@ codespace space [args]        run the Space CLI on this Mac
 codespace job [args]          explicitly offload work to a Space worker
 codespace menu [args]         install, update, or remove the Space menu app
 codespace find <query>        search this Mac, a peer Mac, and Space
-codespace t3 import ...       import a stopped native session into this host’s T3
+codespace t3 scan             discover native sessions using installed T3
+codespace t3 import-project ID import native history into an existing T3 project
+codespace t3 import ...       import one stopped session (preview bridge required)
 codespace sync [status]        publish or inspect nonsecret machine/provider profiles
 
 Aliases for `on` live in ~/.config/codespace/config.json:

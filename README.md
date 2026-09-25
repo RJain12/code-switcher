@@ -38,7 +38,24 @@ Set `sync_uri` in the same config file to a `gs://.../machines` path to read and
 directly when the mounted drive is slow.
 
 
-### T3 session handoff (bridge preview)
+### Installed T3 integration
+
+T3 0.0.42 includes native session discovery and project history import. Configure the local
+T3 token as described below, then use these commands with the installed app:
+
+```sh
+codespace t3 scan
+codespace t3 import-project PROJECT_ID
+codespace on mini t3 scan
+```
+
+`scan` returns native projects and their existing T3 project IDs when available. `import-project`
+imports recent supported CLI history for an existing T3 project using T3's scanner and resume bindings.
+Stop native CLI sessions for that project first. This operation can import multiple sessions across
+configured provider instances. It requires Node 22+ for native WebSocket support; credentials travel
+through stdin and a single-use WebSocket ticket, not command-line arguments.
+
+### Single-session handoff (older bridge preview)
 
 The Codespace T3 server extension is required; stock T3 does not yet expose the import endpoint.
 On the machine that owns the native session, configure `t3_url` (default `http://127.0.0.1:3773`)

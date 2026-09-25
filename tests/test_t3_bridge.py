@@ -151,6 +151,20 @@ class T3Bridge(unittest.TestCase):
         self.assertEqual(session["session_id"], "observed-native")
         self.assertEqual(self.code.completed_session_thread(self.account, "observed-native")["path"], str(path))
 
+    def test_native_rpc_keeps_token_out_of_process_arguments(self):
+        os.environ["CODESPACE_T3_TOKEN"] = "private-test-token"
+        with patch.object(self.client, "require", return_value="node"), patch.object(self.client.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            self.assertEqual(self.client.t3(["scan"]), 0)
+            self.assertNotIn("private-test-token", " ".join(run.call_args.args[0]))
+            request = json.loads(run.call_args.kwargs["input"])
+            self.assertEqual(request["method"], "agentSessions.scan")
+            self.assertEqual(request["payload"], {})
+            self.assertEqual(request["token"], "private-test-token")
+            self.assertEqual(self.client.t3(["import-project", "project-123"]), 0)
+            request = json.loads(run.call_args.kwargs["input"])
+            self.assertEqual(request["method"], "agentSessions.import")
+            self.assertEqual(request["payload"], {"projectId": "project-123"})
+
 
 if __name__ == "__main__":
     unittest.main()
