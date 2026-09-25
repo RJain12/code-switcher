@@ -2830,28 +2830,63 @@ def cmd_doctor(db):
 
 
 KEEP_FRESH_STATE = os.path.join(DATA, "keep-fresh.json")
-# Claude Code refreshes only an expired access token; Codex refreshes when its last refresh is 8+ days old.
-# A tiny request through the official CLI at those points rotates the refresh token before it can lapse.
-CLAUDE_IDLE_AFTER_EXPIRY = 12 * 3600
-CODEX_REFRESH_AGE = 8 * 86400 + 3600
+# Claude Code and Codex refresh only an expired access token (about 8h and 10d lifetimes).
+# A tiny request through the official CLI after expiry rotates the refresh token before it can lapse.
+IDLE_AFTER_EXPIRY = 12 * 3600
 KEEP_FRESH_RETRY = 6 * 3600
+
+
+def jwt_expiry(token):
+    import base64
+    try:
+        payload = token.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))).get("exp")
+    except (AttributeError, IndexError, ValueError):
+        return None
+
+
+def access_expiry(acct):
+    """(expiry epoch seconds, has refresh token) for OAuth logins; None for key-based ones."""
+    if acct["provider"] == "claude" and not acct.get("keyed"):
+        creds = claude_creds(acct) or {}
+        if creds.get("refreshToken") and creds.get("expiresAt"):
+            return creds["expiresAt"] / 1000
+    if acct["provider"] == "codex":
+        tokens = (codex_auth(acct) or {}).get("tokens") or {}
+        if tokens.get("refresh_token"):
+            return jwt_expiry(tokens.get("access_token"))
+    return None
+
+
+def account_in_use(acct):
+    """True when a running CLI uses this account; rotating its refresh token could strand that process."""
+    var = PROVIDERS[acct["provider"]]["env"]
+    home = acct.get("home")
+    try:
+        listing = subprocess.run(["ps", "-Eww", "-o", "command=", "-U", str(os.getuid())],
+                                 capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    names = PROVIDERS[acct["provider"]]["bin"]
+    for line in listing.splitlines():
+        words = line.split()
+        if not words or os.path.basename(words[0]) not in {os.path.basename(n) for n in names} | {"node"}:
+            continue
+        if not any(os.path.basename(n) in line for n in names):
+            continue
+        uses_home = f" {var}={home}" in f" {line} " if home else f" {var}=" not in f" {line} "
+        if uses_home:
+            return True
+    return False
 
 
 def keep_fresh_reason(acct, now):
     """Why an account needs a refreshing request now, or None."""
-    if acct["provider"] == "claude" and not acct.get("keyed"):
-        creds = claude_creds(acct) or {}
-        if not creds.get("refreshToken") or not creds.get("expiresAt"):
-            return None
-        idle = now - creds["expiresAt"] / 1000
-        return f"access token expired {idle / 3600:.0f}h ago" if idle > CLAUDE_IDLE_AFTER_EXPIRY else None
-    if acct["provider"] == "codex":
-        auth = codex_auth(acct) or {}
-        if not (auth.get("tokens") or {}).get("refresh_token") or not auth.get("last_refresh"):
-            return None
-        age = now - iso_ts(auth["last_refresh"])
-        return f"last refreshed {age / 86400:.1f}d ago" if age > CODEX_REFRESH_AGE else None
-    return None
+    expiry = access_expiry(acct)
+    if expiry is None:
+        return None
+    idle = now - expiry
+    return f"access token expired {idle / 3600:.0f}h ago" if idle > IDLE_AFTER_EXPIRY else None
 
 
 def keep_fresh_command(acct):
@@ -2878,6 +2913,9 @@ def cmd_keep_fresh(db, args):
             continue
         if now - state.get(acct["id"], {}).get("attempted", 0) < KEEP_FRESH_RETRY:
             results[acct["id"]] = {"status": "waiting", "reason": reason}
+            continue
+        if account_in_use(acct):
+            results[acct["id"]] = {"status": "in-use", "reason": reason}
             continue
         if dry:
             results[acct["id"]] = {"status": "would-refresh", "reason": reason}
