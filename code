@@ -2486,12 +2486,15 @@ def cmd_thread_export(db, argv):
     parser.add_argument("session_id")
     parser.add_argument("--model")
     parser.add_argument("--deliver-t3", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--deliver-native-t3", action="store_true", help=argparse.SUPPRESS)
     state = parser.add_mutually_exclusive_group(required=True)
     state.add_argument("--completed", action="store_true",
                        help="require Code to have observed this session exit and its transcript to be unchanged")
     state.add_argument("--stopped", action="store_true",
                         help="assert that this native CLI session has stopped before transferring ownership to T3")
     args = parser.parse_args(argv)
+    if args.deliver_native_t3 and (not args.completed or args.deliver_t3):
+        parser.error("native handoff requires --completed and cannot use the preview bridge")
     acct = find(db, args.account)
     if not acct:
         parser.error("unknown account; run code list")
@@ -2501,10 +2504,14 @@ def cmd_thread_export(db, argv):
                 (t for t in recent_threads(acct, 100) if t["id"] == args.session_id), None)
             if not thread:
                 parser.error("session not found among this account's 100 recent threads")
-            payload = json.dumps(session_import_payload(acct, thread, args.model), ensure_ascii=False)
-            if args.deliver_t3:
+            if args.deliver_native_t3:
+                payload = json.dumps({"account": acct["id"], "sessionId": thread["id"],
+                                      "cwd": thread["cwd"], "sourceHome": os.path.realpath(home_of(acct))})
+            else:
+                payload = json.dumps(session_import_payload(acct, thread, args.model), ensure_ascii=False)
+            if args.deliver_t3 or args.deliver_native_t3:
                 companion = os.path.join(os.path.dirname(os.path.realpath(__file__)), "codespace")
-                result = subprocess.run([sys.executable, companion, "t3", "_receive"],
+                result = subprocess.run([sys.executable, companion, "t3", "_receive-native" if args.deliver_native_t3 else "_receive"],
                                         input=payload.encode(), timeout=75)
                 if result.returncode:
                     raise SystemExit(result.returncode)

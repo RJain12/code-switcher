@@ -170,6 +170,12 @@ Both workspace import commands reject provider instances whose history directori
 same location. T3 0.0.42 otherwise imports that history under multiple account identities. Direct
 T3 dispatch remains available; automatic CLI-history handoff awaits account-specific import support.
 
+The Codespace T3 fork adds `agentSessions.importSelected`. With that fork installed,
+`codespace t3 handoff ACCOUNT SESSION_ID` imports one completed Code session while holding its
+account lease. Code requires an unchanged completion receipt and sends only session metadata;
+T3 reads the native history in place. Stock T3 does not support this command. There is no fallback
+to an unfiltered import, and automatic scheduling is not enabled yet.
+
 ### Dispatch an agent directly into T3
 
 After dispatch, `codespace t3 wait THREAD_ID --timeout 300` polls the saved thread and prints its

@@ -632,13 +632,13 @@ def shared_t3_history(settings):
     return conflicts
 
 
-def t3_import_cwd(path, base, token):
+def t3_import_cwd(path, base, token, selection=None):
     import hashlib
     import datetime
     cwd = str(Path(path).expanduser().resolve())
     if not Path(cwd).is_dir():
         raise ValueError("workspace must exist on the execution host")
-    conflicts = shared_t3_history(t3_rpc_value(base, token, "server.getSettings", {}))
+    conflicts = [] if selection else shared_t3_history(t3_rpc_value(base, token, "server.getSettings", {}))
     if conflicts:
         raise ValueError("T3 provider instances share transcript directories: " +
                          "; ".join(" / ".join(pair) for pair in conflicts) +
@@ -651,8 +651,8 @@ def t3_import_cwd(path, base, token):
             "type": "project.create", "commandId": "codespace-project-" + project_id,
             "projectId": project_id, "title": Path(cwd).name or cwd, "workspaceRoot": cwd,
             "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")})
-    result = t3_rpc_value(base, token, "agentSessions.import", {
-        "projectId": project_id, "expectedWorkspaceRoot": cwd})
+    result = t3_rpc_value(base, token, "agentSessions.importSelected" if selection else "agentSessions.import", {
+        "projectId": project_id, "expectedWorkspaceRoot": cwd, **(selection or {})})
     return {"projectId": project_id, "workspaceRoot": cwd, **result}
 
 
@@ -661,6 +661,8 @@ def t3(args, quiet=False):
     import urllib.error
     import urllib.parse
     import urllib.request
+    if len(args) == 3 and args[0] == "handoff":
+        return subprocess.call([require("code"), "thread-export", args[1], args[2], "--completed", "--deliver-native-t3"])
     if args in (["connect"], ["renew"]):
         print(json.dumps(renew_t3_connection(if_needed=args == ["renew"]), indent=2))
         return 0
@@ -674,7 +676,7 @@ def t3(args, quiet=False):
     importing_cwd = len(args) == 2 and args[0] == "import-cwd"
     inspecting = len(args) == 2 and args[0] in ("status", "stop")
     provider_sync = args in (["providers"], ["providers", "--apply"])
-    native = starting or waiting or importing_cwd or inspecting or provider_sync or args == ["scan"] or (len(args) == 2 and args[0] == "import-project")
+    native = starting or waiting or importing_cwd or inspecting or provider_sync or args in (["scan"], ["_receive-native"]) or (len(args) == 2 and args[0] == "import-project")
     if args != ["_receive"] and not native:
         raise SystemExit("usage: codespace t3 scan | providers [--apply] | import-project ID | import ACCOUNT SESSION [--stopped] [--model MODEL]")
     settings = config()
@@ -695,6 +697,27 @@ def t3(args, quiet=False):
             raise SystemExit("codespace: configure CODESPACE_T3_TOKEN or a private t3_token_file from `t3 auth session issue --token-only`") from None
     if not token or any(c.isspace() for c in token):
         raise SystemExit("codespace: invalid T3 session token")
+    if args == ["_receive-native"]:
+        raw = sys.stdin.buffer.read(16385)
+        if len(raw) > 16384:
+            raise ValueError("native handoff metadata is too large")
+        payload = json.loads(raw)
+        account_file = Path(os.environ.get("CODE_ACCOUNTS_DIR", str(Path.home() / ".code-accounts"))) / "accounts.json"
+        accounts = json.loads(account_file.read_text())["accounts"]
+        account = next((a for a in accounts if a["id"] == payload["account"]), None)
+        if not account:
+            raise ValueError("unknown handoff account")
+        settings = t3_rpc_value(base, token, "server.getSettings", {})
+        plan = t3_provider_plan([account], settings)
+        if plan["additions"] or not plan["mappings"]:
+            raise ValueError("configure the account with t3 providers --apply first")
+        mapping = plan["mappings"][0]
+        if os.path.realpath(mapping["home"]) != payload["sourceHome"]:
+            raise ValueError("handoff account home changed")
+        result = t3_import_cwd(payload["cwd"], base, token, {
+            "providerInstanceId": mapping["instance"], "providerSessionId": payload["sessionId"]})
+        print(json.dumps(result, indent=2))
+        return 0
     if starting:
         return t3_start(args[1:], base, token)
     if waiting:
@@ -1055,6 +1078,7 @@ codespace t3 providers [--apply] map Code accounts into this host’s T3
 codespace t3 scan             discover native sessions using installed T3
 codespace t3 import-project ID import native history into an existing T3 project
 codespace t3 import-cwd PATH   create/reuse a T3 project and import native CLI history
+codespace t3 handoff ACCOUNT SESSION  import one completed Code session (Codespace T3 fork)
 codespace t3 import ...       import one stopped session (preview bridge required)
 codespace sync [status]        publish or inspect nonsecret machine/provider profiles
 codespace update [--install | --rollback | --status] manage paired CLI releases

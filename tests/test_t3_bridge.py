@@ -151,9 +151,21 @@ class T3Bridge(unittest.TestCase):
         self.assertEqual(session["session_id"], "observed-native")
         self.assertEqual(self.code.completed_session_thread(self.account, "observed-native")["path"], str(path))
 
+    def test_native_handoff_delivers_only_completed_session_metadata(self):
+        thread = {"id": "native", "cwd": self.tmp.name, "path": str(self.path)}
+        with patch.object(self.code, "completed_session_thread", return_value=thread) as completed, patch.object(self.code, "session_import_payload") as export, patch.object(self.code.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            self.code.cmd_thread_export({"accounts": [self.account]}, [self.account["id"], "native", "--completed", "--deliver-native-t3"])
+            completed.assert_called_once_with(self.account, "native")
+            export.assert_not_called()
+            self.assertEqual(run.call_args.args[0][-1], "_receive-native")
+            payload = json.loads(run.call_args.kwargs["input"])
+            self.assertEqual(payload["sessionId"], "native")
+            self.assertEqual(payload["account"], self.account["id"])
+            self.assertNotIn("messages", payload)
+
     def test_native_rpc_keeps_token_out_of_process_arguments(self):
         os.environ["CODESPACE_T3_TOKEN"] = "private-test-token"
-        with patch.object(self.client, "require", return_value="node"), patch.object(self.client.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+        with patch.object(self.client, "require", return_value="node"), patch.object(self.client.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=b"{}")) as run:
             self.assertEqual(self.client.t3(["scan"]), 0)
             self.assertNotIn("private-test-token", " ".join(run.call_args.args[0]))
             request = json.loads(run.call_args.kwargs["input"])

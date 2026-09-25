@@ -38,3 +38,12 @@ class ImportCwd(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'share transcript'):
                     client.t3_import_cwd(tmp, 'http://localhost', 'fixture')
                 http.assert_not_called()
+
+    def test_selected_import_never_falls_back_to_unfiltered_rpc(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ):
+            client = load(os.path.join(ROOT, 'codespace'), tmp)
+            selection = {'providerInstanceId': 'work', 'providerSessionId': 'session'}
+            with patch.object(client, 't3_http', return_value={'projects': [{'id': 'existing', 'workspaceRoot': os.path.realpath(tmp)}]}), patch.object(client, 't3_rpc_value', side_effect=ValueError('unsupported method')) as rpc:
+                with self.assertRaisesRegex(ValueError, 'unsupported'):
+                    client.t3_import_cwd(tmp, 'http://localhost', 'fixture', selection)
+                rpc.assert_called_once_with('http://localhost', 'fixture', 'agentSessions.importSelected', {'projectId': 'existing', 'expectedWorkspaceRoot': os.path.realpath(tmp), **selection})
